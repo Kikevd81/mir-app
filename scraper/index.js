@@ -4,11 +4,15 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Supabase
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
-const supabaseKey = process.env.VITE_SUPABASE_ANON_KEY;
+const supabaseKey = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error('Missing Supabase credentials in .env file');
   process.exit(1);
+}
+
+if (!process.env.VITE_SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn('⚠️ WARNING: Using ANON_KEY. Inserts might fail if RLS blocks anonymous users. Please set VITE_SUPABASE_SERVICE_ROLE_KEY.');
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -65,14 +69,22 @@ async function runScraper() {
     const request = response.request();
     const url = request.url();
     
-    // We are looking for the getPlazasAdjudicadas API call
-    if (url.includes('getPlazasAdjudicadas') && request.method() === 'GET') {
+    // We are looking for the getPlazasAdjudicadas API call with parameters
+    if (url.includes('/getPlazasAdjudicadas?') && request.method() === 'GET') {
       console.log(`\n📥 Intercepted response from: ${url}`);
       try {
         const json = await response.json();
         if (json && json.data) {
           adjudicacionesData = json.data;
-          console.log(`✅ Extracted ${adjudicacionesData.length} records from JSON!`);
+          console.log(`✅ Extracted ${adjudicacionesData.length} records from JSON! (using json.data)`);
+        } else if (Array.isArray(json)) {
+          adjudicacionesData = json;
+          console.log(`✅ Extracted ${adjudicacionesData.length} records from JSON! (is array)`);
+        } else {
+          console.log('JSON structure:', Object.keys(json));
+          // if it's paginated or something
+          if (json.content) adjudicacionesData = json.content;
+          if (json.plazas) adjudicacionesData = json.plazas;
         }
       } catch (e) {
         console.log("Failed to parse JSON:", e.message);
@@ -86,7 +98,7 @@ async function runScraper() {
   });
 
   console.log('⏳ Waiting for Angular to load...');
-  await page.waitForTimeout(3000);
+  await new Promise(r => setTimeout(r, 3000));
 
   try {
     console.log('🖱️ Selecting "MEDICINA" in Titulación dropdown...');
@@ -95,7 +107,7 @@ async function runScraper() {
     const dropdowns = await page.$$('ng-select');
     if (dropdowns.length > 0) {
       await dropdowns[0].click();
-      await page.waitForTimeout(1000);
+      await new Promise(r => setTimeout(r, 1000));
       
       // Look for the "MEDICINA" option
       const options = await page.$$('.ng-option');
@@ -108,7 +120,7 @@ async function runScraper() {
       }
     }
 
-    await page.waitForTimeout(1000);
+    await new Promise(r => setTimeout(r, 1000));
 
     console.log('🔍 Clicking "Buscar"...');
     // Find the submit button
@@ -125,7 +137,7 @@ async function runScraper() {
     console.log('⏳ Waiting for API response...');
     for (let i = 0; i < 15; i++) {
       if (adjudicacionesData) break;
-      await page.waitForTimeout(1000);
+      await new Promise(r => setTimeout(r, 1000));
     }
 
   } catch (error) {
@@ -143,6 +155,9 @@ async function runScraper() {
 
 async function processAndSaveData(data) {
   console.log(`💾 Processing ${data.length} records for Supabase...`);
+  if (data.length > 0) {
+    console.log('Sample record:', data[0]);
+  }
   
   let successCount = 0;
   let errorCount = 0;
@@ -169,10 +184,8 @@ async function processAndSaveData(data) {
           order_number: orderNumber,
           specialty_name: specialtyName,
           hospital_name: hospitalName,
-          region: '', // We might not have this directly, but province is more important
+          region: item.desccaa || '', 
           province: province,
-          locality: locality,
-          adjudication_datetime: parseDate(dateAdjudicated),
           specialty_id: specId,
           hospital_id: hospId,
           scraped_at: new Date().toISOString()
@@ -192,14 +205,57 @@ async function processAndSaveData(data) {
   console.log(`✅ Saved ${successCount} new records.`);
   if (errorCount > 0) console.log(`❌ Failed to save ${errorCount} records.`);
 
-  console.log('🔢 Updating available slots...');
-  const { error: rpcError } = await supabase.rpc('update_available_slots');
+  console.log('🔢 Updating available slots via API (with Fuzzy Matching)...');
   
-  if (rpcError) {
-    console.error('⚠️ Error updating available slots:', rpcError);
-  } else {
-    console.log('✅ Available slots updated successfully!');
+  // 1. Fetch all slots and adjudications into memory
+  const { data: slots, error: slotsError } = await supabase.from('slots').select('*');
+  const { data: adjudications, error: adjError } = await supabase.from('adjudications').select('hospital_id, specialty_id');
+  
+  if (slotsError || adjError) {
+    console.error('⚠️ Error fetching data for update:', slotsError || adjError);
+    process.exit(1);
   }
+
+  // 2. Helper to normalize for fuzzy matching
+  const tokenize = (id) => id.split('-').filter(w => !['de', 'y', 'la', 'el', 'en', 'h', 'c', 'udm', 'area', 'especializada', 'hospital', 'universitario'].includes(w) && w.length > 2);
+
+  // 3. Count adjudications for each slot using fuzzy matching
+  let updatedCount = 0;
+  
+  for (const slot of slots) {
+    let matchCount = 0;
+    const slotTokens = tokenize(slot.hospital_id);
+    
+    for (const adj of adjudications) {
+      if (adj.specialty_id === slot.specialty_id) {
+        // Exact match
+        if (adj.hospital_id === slot.hospital_id) {
+          matchCount++;
+        } else {
+          // Fuzzy match: check if one contains the other, or high token overlap
+          if (adj.hospital_id.includes(slot.hospital_id) || slot.hospital_id.includes(adj.hospital_id)) {
+            matchCount++;
+          } else {
+            const adjTokens = tokenize(adj.hospital_id);
+            // Check if all important tokens from slot exist in adj
+            const matches = slotTokens.filter(t => adjTokens.includes(t));
+            // If we match at least 80% of the significant words
+            if (slotTokens.length > 0 && matches.length / slotTokens.length >= 0.8) {
+               matchCount++;
+            }
+          }
+        }
+      }
+    }
+    
+    const newAvailable = Math.max(0, slot.total - matchCount);
+    if (newAvailable !== slot.available) {
+      await supabase.from('slots').update({ available: newAvailable }).eq('id', slot.id);
+      updatedCount++;
+    }
+  }
+
+  console.log(`✅ Updated ${updatedCount} slots successfully using fuzzy matching!`);
   
   process.exit(0);
 }
