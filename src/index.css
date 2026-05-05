@@ -1,0 +1,106 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Playfair+Display:wght@700;900&display=swap');
+
+:root {
+  /* Paleta Médica High-End - Light Mode */
+  --mir-primary: #2563eb;
+  --mir-primary-soft: #eff6ff;
+  --mir-primary-dark: #1e40af;
+  --mir-secondary: #0f172a;
+  --mir-accent: #06b6d4;
+
+  /* Estados Profesionales */
+  --mir-success: #10b981;
+  --mir-success-soft: #ecfdf5;
+  --mir-warning: #f59e0b;
+  --mir-error: #ef4444;
+  --mir-error-soft: #fef2f2;
+
+  /* Superficies Limpias */
+  --mir-bg: #f8fafc;
+  --mir-surface: #ffffff;
+  --mir-border: #e2e8f0;
+  --mir-border-focus: #bfdbfe;
+
+  /* Tipografía */
+  --mir-font-main: 'Outfit', sans-serif;
+  --mir-font-serif: 'Playfair Display', serif;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: var(--mir-font-main);
+  background-color: var(--mir-bg);
+  color: var(--text-primary);
+  line-height: 1.5;
+  overflow-x: hidden;
+  min-height: 100vh;
+}
+
+/* Scrollbar Profesional */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--mir-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--mir-border);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--mir-font-main);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--mir-secondary);
+}
+
+/* Card System V3 */
+.card-premium {
+  background: var(--mir-surface);
+  border: 1px solid var(--mir-border);
+  border-radius: 20px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02), 0 2px 4px -1px rgba(0, 0, 0, 0.01);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card-premium:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.03);
+  border-color: var(--mir-border-focus);
+}
+
+/* Utility Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade {
+  animation: fadeIn 0.4s ease-out forwards;
+}

@@ -1,0 +1,31 @@
+name: MIR Scraper
+
+on:
+  schedule:
+    # Ejecutar cada 5 minutos (durante todo el día, puedes ajustarlo)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Permite ejecutarlo manualmente desde la web de GitHub
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install dependencies
+      working-directory: ./scraper
+      run: npm ci || npm install
+      
+    - name: Run scraper
+      working-directory: ./scraper
+      env:
+        VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+        VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      run: node index.js
