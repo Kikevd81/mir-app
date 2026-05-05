@@ -32,6 +32,20 @@ const generateId = (text) => {
 
 async function runScraper() {
   console.log('🚀 Starting MIR Scraper...');
+
+  // Check configuration first
+  const { data: config, error: configError } = await supabase
+    .from('scraper_config')
+    .select('is_enabled')
+    .single();
+
+  if (configError) {
+    console.error('⚠️ Could not check config, proceeding anyway:', configError.message);
+  } else if (config && config.is_enabled === false) {
+    console.log('🛑 Scraper is disabled in the database configuration. Exiting.');
+    process.exit(0);
+  }
+
   
   const browser = await puppeteer.launch({
     headless: "new",
