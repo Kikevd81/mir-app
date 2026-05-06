@@ -21,11 +21,18 @@ jobs:
         
     - name: Install dependencies
       working-directory: ./scraper
-      run: npm ci || npm install
+      run: npm install
       
     - name: Run scraper
       working-directory: ./scraper
       env:
         VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
         VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-      run: node index.js
+        VITE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.VITE_SUPABASE_SERVICE_ROLE_KEY }}
+      run: |
+        if [ -z "$VITE_SUPABASE_URL" ]; then
+          echo "❌ ERROR CRÍTICO: No se han configurado los Secrets en GitHub."
+          echo "Por favor, ve a Settings -> Secrets and variables -> Actions y añade VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY y VITE_SUPABASE_SERVICE_ROLE_KEY"
+          exit 1
+        fi
+        node index.js

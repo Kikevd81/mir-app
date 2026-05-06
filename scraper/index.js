@@ -52,8 +52,8 @@ async function runScraper() {
 
   
   const browser = await puppeteer.launch({
-    headless: "new",
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    headless: true, // "new" is deprecated in v22+
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
   });
   
   const page = await browser.newPage();
@@ -208,11 +208,24 @@ async function processAndSaveData(data) {
   console.log('🔢 Updating available slots via API (with Fuzzy Matching)...');
   
   // 1. Fetch all slots and adjudications into memory
-  const { data: slots, error: slotsError } = await supabase.from('slots').select('*');
+  let allSlots = [];
+  let page = 0;
+  while(true) {
+    const { data, error } = await supabase.from('slots').select('*').range(page * 1000, (page + 1) * 1000 - 1);
+    if (error) {
+      console.error('⚠️ Error fetching slots:', error);
+      process.exit(1);
+    }
+    if (!data || data.length === 0) break;
+    allSlots.push(...data);
+    page++;
+  }
+  const slots = allSlots;
+  
   const { data: adjudications, error: adjError } = await supabase.from('adjudications').select('hospital_id, specialty_id');
   
-  if (slotsError || adjError) {
-    console.error('⚠️ Error fetching data for update:', slotsError || adjError);
+  if (adjError) {
+    console.error('⚠️ Error fetching adjudications:', adjError);
     process.exit(1);
   }
 
