@@ -1,294 +1,233 @@
 require('dotenv').config({ path: '../.env' });
-const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
+const puppeteer = require('puppeteer');
 
-// Initialize Supabase
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
-const supabaseKey = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+const supabaseKey = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
-  console.error('Missing Supabase credentials in .env file');
+  console.error('❌ Missing environment variables');
   process.exit(1);
-}
-
-if (!process.env.VITE_SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn('⚠️ WARNING: Using ANON_KEY. Inserts might fail if RLS blocks anonymous users. Please set VITE_SUPABASE_SERVICE_ROLE_KEY.');
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Helper function to normalize IDs (same as in your app)
+async function fetchAllRows(table, select = '*') {
+  let allData = [];
+  let from = 0;
+  const limit = 1000;
+  while (true) {
+    const { data, error } = await supabase.from(table).select(select).range(from, from + limit - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    allData.push(...data);
+    if (data.length < limit) break;
+    from += limit;
+  }
+  return allData;
+}
+
 const normalizeText = (text) => {
   if (!text) return '';
-  return String(text)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .trim();
-};
-
-const generateId = (text) => {
-  return normalizeText(text)
+  return text.toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 };
 
+const generateId = (text) => normalizeText(text);
+
 async function runScraper() {
-  console.log('🚀 Starting MIR Scraper...');
-
-  // Check configuration first
-  const { data: config, error: configError } = await supabase
-    .from('scraper_config')
-    .select('is_enabled')
-    .single();
-
-  if (configError) {
-    console.error('⚠️ Could not check config, proceeding anyway:', configError.message);
-  } else if (config && config.is_enabled === false) {
-    console.log('🛑 Scraper is disabled in the database configuration. Exiting.');
-    process.exit(0);
-  }
-
+  console.log('🚀 Starting Robust MIR Scraper...');
   
   const browser = await puppeteer.launch({
-    headless: true, // "new" is deprecated in v22+
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
-  
+
   const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   
-  // Set a larger timeout
-  page.setDefaultNavigationTimeout(60000);
-  page.setDefaultTimeout(60000);
+  let capturedRecords = new Map();
+  let finished = false;
 
-  let adjudicacionesData = null;
-
-  // Intercept network requests
   page.on('response', async (response) => {
-    const request = response.request();
-    const url = request.url();
+    const url = response.url();
+    // Log ANY response from the sanidad.gob.es domain
+    if (url.includes('sanidad.gob.es')) {
+       const size = response.headers()['content-length'] || 'unknown';
+       console.log(`📡 Intercepted: ${url.substring(0, 100)}... (Status: ${response.status()}, Type: ${response.headers()['content-type']}, Size: ${size})`);
+    }
     
-    // We are looking for the getPlazasAdjudicadas API call with parameters
-    if (url.includes('/getPlazasAdjudicadas?') && request.method() === 'GET') {
-      console.log(`\n📥 Intercepted response from: ${url}`);
-      try {
-        const json = await response.json();
-        if (json && json.data) {
-          adjudicacionesData = json.data;
-          console.log(`✅ Extracted ${adjudicacionesData.length} records from JSON! (using json.data)`);
-        } else if (Array.isArray(json)) {
-          adjudicacionesData = json;
-          console.log(`✅ Extracted ${adjudicacionesData.length} records from JSON! (is array)`);
-        } else {
-          console.log('JSON structure:', Object.keys(json));
-          // if it's paginated or something
-          if (json.content) adjudicacionesData = json.content;
-          if (json.plazas) adjudicacionesData = json.plazas;
-        }
-      } catch (e) {
-        console.log("Failed to parse JSON:", e.message);
+    // Broaden the filter for the data
+    if (url.includes('getPlazasAdjudicadas') || url.includes('plazasAdjudicadas') || url.includes('adjudicacion')) {
+      if (response.status() === 200) {
+        try {
+          const contentType = response.headers()['content-type'];
+          if (contentType && contentType.includes('application/json')) {
+            const json = await response.json();
+            console.log(`📦 JSON Intercepted from ${url.substring(0, 50)}... Keys: ${Object.keys(json).join(', ')}`);
+            let newData = Array.isArray(json) ? json : (json.data || json.content || json.plazas || json.listado || []);
+            if (newData.length > 0) {
+              console.log(`📊 Found ${newData.length} items in JSON. Sample: ${JSON.stringify(newData[0]).substring(0, 100)}`);
+              if (newData[0].numOrden || newData[0].numorden || newData[0].num_orden) {
+                newData.forEach(item => {
+                  const order = item.numOrden || item.numorden || item.num_orden;
+                  if (order) capturedRecords.set(order, item);
+                });
+                console.log(`✅ Captured ${newData.length} records. Total: ${capturedRecords.size}`);
+                finished = true;
+              }
+            }
+          }
+        } catch (e) {}
       }
     }
   });
 
-  console.log('🌐 Navigating to the Ministry website...');
-  await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-    waitUntil: 'networkidle2'
-  });
-
-  console.log('⏳ Waiting for Angular to load...');
-  await new Promise(r => setTimeout(r, 3000));
-
-  try {
-    console.log('🖱️ Selecting "MEDICINA" in Titulación dropdown...');
-    // Find the ng-select for Titulación and click it
-    // The dropdowns are likely ng-select components
-    const dropdowns = await page.$$('ng-select');
-    if (dropdowns.length > 0) {
-      await dropdowns[0].click();
-      await new Promise(r => setTimeout(r, 1000));
+  const targetUrl = 'https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas';
+  
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    console.log(`📡 Attempt ${attempt}: Navigating to ${targetUrl}...`);
+    try {
+      await page.goto(targetUrl, { timeout: 60000, waitUntil: 'domcontentloaded' }).catch(() => {});
       
-      // Look for the "MEDICINA" option
-      const options = await page.$$('.ng-option');
-      for (const option of options) {
-        const text = await option.evaluate(el => el.textContent);
-        if (text && text.includes('MEDICINA')) {
-          await option.click();
-          break;
-        }
+      // Wait for the page to at least start loading Angular
+      await new Promise(r => setTimeout(r, 10000));
+      
+      // Try to interact if needed (sometimes selecting the titulacion triggers the API)
+      const dropdowns = await page.$$('ng-select');
+      if (dropdowns.length > 0) {
+        console.log('🖱️ Found dropdowns, selecting MEDICINA...');
+        await dropdowns[0].click();
+        await new Promise(r => setTimeout(r, 1000));
+        await page.keyboard.type('MEDICINA');
+        await page.keyboard.press('Enter');
+        await new Promise(r => setTimeout(r, 2000));
+        
+        // Find and click the search button
+        console.log('🖱️ Clicking Consultar button...');
+        await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button'));
+          const target = btns.find(b => b.textContent.includes('Consultar') || b.textContent.includes('BUSCAR'));
+          if (target) {
+            target.scrollIntoView();
+            target.click();
+          }
+        });
       }
-    }
 
-    await new Promise(r => setTimeout(r, 1000));
-
-    console.log('🔍 Clicking "Buscar"...');
-    // Find the submit button
-    const buttons = await page.$$('button');
-    for (const btn of buttons) {
-      const text = await btn.evaluate(el => el.textContent);
-      if (text && text.toLowerCase().includes('buscar')) {
-        await btn.click();
-        break;
+      // Wait and check if we got data
+      for (let i = 0; i < 30; i++) {
+        if (finished) break;
+        await new Promise(r => setTimeout(r, 1000));
       }
-    }
 
-    // Wait for the data to be intercepted
-    console.log('⏳ Waiting for API response...');
-    for (let i = 0; i < 15; i++) {
-      if (adjudicacionesData) break;
-      await new Promise(r => setTimeout(r, 1000));
+      if (finished) break;
+    } catch (err) {
+      console.log(`⚠️ Attempt ${attempt} failed: ${err.message}`);
     }
-
-  } catch (error) {
-    console.error('❌ Error interacting with the page:', error);
   }
 
   await browser.close();
 
-  if (adjudicacionesData && adjudicacionesData.length > 0) {
-    await processAndSaveData(adjudicacionesData);
+  const data = Array.from(capturedRecords.values());
+  if (data.length > 0) {
+    console.log(`💾 Processing ${data.length} adjudications...`);
+    await processAndSaveData(data);
   } else {
-    console.log('⚠️ No data was captured. The scraper might need to be adjusted or there are no adjudications yet.');
+    console.error('❌ Scraper failed to capture any data after multiple attempts.');
+    process.exit(1);
   }
 }
 
 async function processAndSaveData(data) {
-  console.log(`💾 Processing ${data.length} records for Supabase...`);
-  if (data.length > 0) {
-    console.log('Sample record:', data[0]);
-  }
-  
-  let successCount = 0;
-  let errorCount = 0;
+  console.log('📊 Fetching reference data for matching...');
+  const { data: specialties } = await supabase.from('specialties').select('*');
+  const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
 
-  for (const item of data) {
-    try {
-      // Map the API fields to our database fields
-      // Expected API fields: numOrden (or numorden), desEspecialidad (or desespec), desCentro (or descentro), localidad, despro, fechaHoraAdju
-      const orderNumber = item.numOrden || item.numorden;
-      const specialtyName = item.desEspecialidad || item.desespec || '';
-      const hospitalName = item.desCentro || item.descentro || '';
-      const province = item.despro || item.provincia || '';
-      const locality = item.localidad || item.deslocalidad || '';
-      const dateAdjudicated = item.fechaHoraAdju || item.fechaHora || new Date().toISOString();
+  // Fetch unique hospital IDs from slots to build a matching map
+  const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
+  const existingHospitalIds = [...new Set(existingSlots.map(s => s.hospital_id))];
 
-      if (!orderNumber || !specialtyName) continue;
+  console.log(`🔎 Found ${existingHospitalIds.length} unique hospital IDs in database.`);
 
-      const specId = generateId(specialtyName);
-      const hospId = generateId(`${province}-${hospitalName}`);
-
-      const { error } = await supabase
-        .from('adjudications')
-        .upsert({
-          order_number: orderNumber,
-          specialty_name: specialtyName,
-          hospital_name: hospitalName,
-          region: item.desccaa || '', 
-          province: province,
-          specialty_id: specId,
-          hospital_id: hospId,
-          scraped_at: new Date().toISOString()
-        }, { onConflict: 'order_number' });
-
-      if (error) {
-        console.error(`Error saving order ${orderNumber}:`, error.message);
-        errorCount++;
-      } else {
-        successCount++;
-      }
-    } catch (e) {
-      errorCount++;
-    }
-  }
-
-  console.log(`✅ Saved ${successCount} new records.`);
-  if (errorCount > 0) console.log(`❌ Failed to save ${errorCount} records.`);
-
-  console.log('🔢 Updating available slots via API (with Fuzzy Matching)...');
-  
-  // 1. Fetch all slots and adjudications into memory
-  let allSlots = [];
-  let page = 0;
-  while(true) {
-    const { data, error } = await supabase.from('slots').select('*').range(page * 1000, (page + 1) * 1000 - 1);
-    if (error) {
-      console.error('⚠️ Error fetching slots:', error);
-      process.exit(1);
-    }
-    if (!data || data.length === 0) break;
-    allSlots.push(...data);
-    page++;
-  }
-  const slots = allSlots;
-  
-  const { data: adjudications, error: adjError } = await supabase.from('adjudications').select('hospital_id, specialty_id');
-  
-  if (adjError) {
-    console.error('⚠️ Error fetching adjudications:', adjError);
-    process.exit(1);
-  }
-
-  // 2. Helper to normalize for fuzzy matching
-  const tokenize = (id) => id.split('-').filter(w => !['de', 'y', 'la', 'el', 'en', 'h', 'c', 'udm', 'area', 'especializada', 'hospital', 'universitario'].includes(w) && w.length > 2);
-
-  // 3. Count adjudications for each slot using fuzzy matching
-  let updatedCount = 0;
-  
-  for (const slot of slots) {
-    let matchCount = 0;
-    const slotTokens = tokenize(slot.hospital_id);
+  const findBestHospitalId = (hospName, province, locality) => {
+    const normName = normalizeText(hospName);
+    const normProv = normalizeText(province);
+    const normLoc = normalizeText(locality);
     
-    for (const adj of adjudications) {
-      if (adj.specialty_id === slot.specialty_id) {
-        // Exact match
-        if (adj.hospital_id === slot.hospital_id) {
-          matchCount++;
-        } else {
-          // Fuzzy match: check if one contains the other, or high token overlap
-          if (adj.hospital_id.includes(slot.hospital_id) || slot.hospital_id.includes(adj.hospital_id)) {
-            matchCount++;
-          } else {
-            const adjTokens = tokenize(adj.hospital_id);
-            // Check if all important tokens from slot exist in adj
-            const matches = slotTokens.filter(t => adjTokens.includes(t));
-            // If we match at least 80% of the significant words
-            if (slotTokens.length > 0 && matches.length / slotTokens.length >= 0.8) {
-               matchCount++;
-            }
-          }
-        }
-      }
+    // Pattern 1: province-locality-hospital (Valencia case)
+    const p1 = `${normProv}-${normLoc}-${normName}`;
+    if (existingHospitalIds.includes(p1)) return p1;
+    
+    // Pattern 2: province-hospital
+    const p2 = `${normProv}-${normName}`;
+    if (existingHospitalIds.includes(p2)) return p2;
+    
+    // Pattern 3: Just the name (if unique)
+    if (existingHospitalIds.includes(normName)) return normName;
+    
+    // Pattern 4: Fuzzy match - find ID that contains the hospital name
+    const match = existingHospitalIds.find(id => id.includes(normName));
+    if (match) return match;
+
+    return p2; // Fallback
+  };
+
+  const findBestSpecialtyId = (specName) => {
+    const norm = specName.toLowerCase();
+    if (specialtyMap.has(norm)) return specialtyMap.get(norm);
+    
+    // Try fuzzy match on specialties
+    for (const [name, id] of specialtyMap.entries()) {
+      if (norm.includes(name) || name.includes(norm)) return id;
     }
     
-    const newAvailable = Math.max(0, slot.total - matchCount);
-    if (newAvailable !== slot.available) {
-      await supabase.from('slots').update({ available: newAvailable }).eq('id', slot.id);
-      updatedCount++;
+    return generateId(specName);
+  };
+
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < data.length; i += BATCH_SIZE) {
+    const batch = data.slice(i, i + BATCH_SIZE);
+    const upserts = batch.map(item => {
+      const specialtyName = item.descEspecialidad || item.descespecialidad;
+      const hospitalName = item.descCentro || item.desccentro;
+      const province = item.descProvincia || item.descprovincia;
+      const locality = item.descLocalidad || item.desclocalidad || province;
+
+      return {
+        order_number: item.numOrden || item.numorden,
+        specialty_name: specialtyName,
+        hospital_name: hospitalName,
+        province: province,
+        locality: locality,
+        region: item.descComunidad || item.desccomunidad,
+        specialty_id: findBestSpecialtyId(specialtyName),
+        hospital_id: findBestHospitalId(hospitalName, province, locality)
+      };
+    });
+
+    const { error } = await supabase.from('adjudications').upsert(upserts, { onConflict: 'order_number' });
+    if (error) console.error('❌ Error in batch upsert:', error.message);
+    
+    if ((i + BATCH_SIZE) % 500 === 0 || i + BATCH_SIZE >= data.length) {
+      console.log(`⏳ Progress: ${Math.min(i + BATCH_SIZE, data.length)}/${data.length} records processed.`);
     }
   }
 
-  console.log(`✅ Updated ${updatedCount} slots successfully using fuzzy matching!`);
+  console.log('🔄 Triggering SQL sync...');
+  await supabase.rpc('update_available_slots');
   
-  process.exit(0);
-}
+  await supabase.from('scraper_config').update({
+    last_scrape_at: new Date().toISOString(),
+    last_scrape_status: 'success',
+    total_adjudications_processed: data.length,
+    updated_at: new Date().toISOString()
+  }).limit(1);
 
-function parseDate(dateStr) {
-  if (!dateStr) return new Date().toISOString();
-  // If it's already ISO
-  if (dateStr.includes('T')) return dateStr;
-  
-  // Try to parse format "DD/MM/YYYY HH:mm:ss"
-  try {
-    const parts = dateStr.split(' ');
-    if (parts.length === 2) {
-      const [day, month, year] = parts[0].split('/');
-      return `${year}-${month}-${day}T${parts[1]}Z`;
-    }
-  } catch (e) {
-    // Ignore and return current
-  }
-  return new Date().toISOString();
+  console.log('✅ Done!');
 }
 
 runScraper();
