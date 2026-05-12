@@ -24,7 +24,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Token Extraction" MIR Scraper...');
+  console.log('🚀 Starting "Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -32,98 +32,81 @@ async function runScraper() {
   });
 
   const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 800 });
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
   let interceptedData = null;
-  let authHeader = null;
 
-  // Intercept requests to steal the Authorization header
-  await page.setRequestInterception(true);
-  page.on('request', (request) => {
-    const headers = request.headers();
-    if (headers['authorization'] || headers['Authorization']) {
-      authHeader = headers['authorization'] || headers['Authorization'];
-    }
-    request.continue();
-  });
-
-  // Intercept responses as a backup
+  // Passive hunter: listen for any large JSON response
   page.on('response', async (response) => {
     const url = response.url();
-    if (url.includes('listadosInicialPlazas') || url.includes('listadosInicial')) {
+    if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
-        if (text && text.length > 5000) {
+        if (text && text.length > 5000) { // Large enough to be the real list
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.length > 100) {
+          if (Array.isArray(data) && data.length > 500) {
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records from ${url}`);
             interceptedData = data;
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        // Silent fail for non-JSON or small responses
+      }
     }
   });
 
   try {
-    console.log('📡 Navigating to Ministry Portal...');
-    await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-      waitUntil: 'networkidle2',
-      timeout: 60000
-    });
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      console.log(`📡 Attempt ${attempt}/5: Navigating to Ministry Portal...`);
+      await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
+        waitUntil: 'networkidle2',
+        timeout: 60000
+      });
 
-    console.log('🖱️ Selecting MEDICINA to trigger token generation...');
-    await page.evaluate(() => {
-      const selects = document.querySelectorAll('select');
-      for (const s of selects) {
-        if (s.innerText.includes('MEDICINA') || s.innerHTML.includes('MEDICINA')) {
-          s.value = s.options[1].value;
-          s.dispatchEvent(new Event('change'));
+      console.log('🖱️ Selecting MEDICINA...');
+      await page.evaluate(async () => {
+        const selects = document.querySelectorAll('select');
+        for (const s of selects) {
+          if (s.innerText.includes('MEDICINA') || s.innerHTML.includes('MEDICINA')) {
+            s.value = s.options[1].value;
+            s.dispatchEvent(new Event('change'));
+            return true;
+          }
         }
-      }
-    });
+        return false;
+      });
 
-    // Wait for the token to be captured
-    let waitCount = 0;
-    while (!authHeader && waitCount < 15) {
-      await new Promise(r => setTimeout(r, 1000));
-      waitCount++;
-    }
+      await new Promise(r => setTimeout(r, 3000));
 
-    if (authHeader) {
-      console.log('🔑 Authorization Token captured! Executing privileged fetch...');
-      const data = await page.evaluate(async (token) => {
-        const response = await fetch('https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas/listadosInicialPlazas', {
-          headers: { 'Authorization': token }
-        });
-        const json = await response.json();
-        return json.data || json;
-      }, authHeader);
-
-      if (Array.isArray(data) && data.length > 0) {
-        console.log(`✅ SUCCESS: Fetched ${data.length} records using captured token.`);
-        interceptedData = data;
-      }
-    }
-
-    if (!interceptedData) {
-      console.log('🔄 Token fetch failed, trying final manual interaction...');
+      console.log('🖱️ Clicking Consultar...');
       await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
-        const target = btns.find(b => b.innerText.includes('Consultar'));
-        if (target) target.click();
+        const target = btns.find(b => b.innerText.includes('Consultar') || b.textContent.includes('Consultar'));
+        if (target) {
+          target.click();
+          return true;
+        }
+        return false;
       });
-      let finalWait = 0;
-      while (!interceptedData && finalWait < 20) {
+
+      // Wait up to 20 seconds for the hunter to catch the data
+      console.log('⏳ Waiting for data to flow...');
+      for (let i = 0; i < 20; i++) {
+        if (interceptedData) break;
         await new Promise(r => setTimeout(r, 1000));
-        finalWait++;
       }
+
+      if (interceptedData) break;
+      console.log('⚠️ No data captured in this attempt. Retrying...');
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Failed to capture data. Portal might be down or heavily protected.');
+      console.error('❌ Failed to capture data after 5 attempts. The Ministry portal might be under heavy load.');
       process.exit(1);
     }
 
@@ -136,7 +119,7 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log('📊 Processing data...');
+  console.log(`📊 Processing ${data.length} records...`);
   
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
@@ -149,18 +132,16 @@ async function processAndSaveData(data) {
     const normProv = normalizeText(province);
     const normLoc = normalizeText(locality);
     
-    const patterns = [
-      `${normProv}-${normLoc}-${normName}`,
-      `${normProv}-${normName}`,
-      normName
-    ];
+    // Exact match patterns
+    const p1 = `${normProv}-${normLoc}-${normName}`;
+    const p2 = `${normProv}-${normName}`;
     
-    for (const p of patterns) {
-      if (existingHospitalIds.includes(p)) return p;
-    }
+    if (existingHospitalIds.includes(p1)) return p1;
+    if (existingHospitalIds.includes(p2)) return p2;
     
+    // Fuzzy search
     const match = existingHospitalIds.find(id => id.includes(normName));
-    return match || patterns[1];
+    return match || p2;
   };
 
   const findBestSpecialtyId = (specName) => {
@@ -197,8 +178,9 @@ async function processAndSaveData(data) {
     if (error) console.error('❌ Upsert error:', error.message);
   }
 
-  console.log('🔄 Triggering availability sync...');
-  await supabase.rpc('update_available_slots');
+  console.log('🔄 Sincronizando disponibilidad...');
+  const { error: rpcError } = await supabase.rpc('update_available_slots');
+  if (rpcError) console.error('❌ RPC Error:', rpcError.message);
 }
 
 runScraper();
