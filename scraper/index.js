@@ -40,19 +40,21 @@ async function runScraper() {
   // Passive hunter: listen for any large JSON response
   page.on('response', async (response) => {
     const url = response.url();
+    // Look for URLs that likely contain the adjudications list
     if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
-        if (text && text.length > 5000) { // Large enough to be the real list
+        // The real adjudication list is VERY large (>100KB) and MUST contain 'numOrden'
+        if (text && text.includes('numOrden') && text.length > 50000) {
           const json = JSON.parse(text);
           const data = json.data || json;
           if (Array.isArray(data) && data.length > 500) {
-            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records from ${url}`);
+            console.log(`🎯 TARGET ACQUIRED: Captured adjudications list (${data.length} records) from ${url}`);
             interceptedData = data;
           }
         }
       } catch (e) {
-        // Silent fail for non-JSON or small responses
+        // Silent fail
       }
     }
   });
@@ -162,6 +164,8 @@ async function processAndSaveData(data) {
       const prov = item.descProvincia || item.descprovincia;
       const loc = item.descLocalidad || item.desclocalidad || prov;
 
+      if (!sName || !hName) return null; // Skip malformed items
+
       return {
         order_number: item.numOrden || item.numorden,
         specialty_name: sName,
@@ -172,7 +176,7 @@ async function processAndSaveData(data) {
         specialty_id: findBestSpecialtyId(sName),
         hospital_id: findBestHospitalId(hName, prov, loc)
       };
-    });
+    }).filter(x => x !== null);
 
     const { error } = await supabase.from('adjudications').upsert(upserts, { onConflict: 'order_number' });
     if (error) console.error('❌ Upsert error:', error.message);
