@@ -24,7 +24,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Ultra Hunter" MIR Scraper...');
+  console.log('🚀 Starting "Reliable Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -39,14 +39,15 @@ async function runScraper() {
 
   page.on('response', async (response) => {
     const url = response.url();
-    if (url.includes('api/datos') && response.status() === 200) {
+    // Targeted capture of the adjudication list
+    if (url.includes('getPlazasAdjudicadas/listados/M') && response.status() === 200) {
       try {
         const text = await response.text();
-        if (text && text.includes('numOrden') && text.length > 50000) {
+        if (text && text.includes('numOrden')) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.length > 500) {
-            console.log(`🎯 TARGET ACQUIRED: Captured adjudications list (${data.length} records) from ${url}`);
+          if (Array.isArray(data)) {
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} adjudications!`);
             interceptedData = data;
           }
         }
@@ -57,16 +58,18 @@ async function runScraper() {
   try {
     for (let attempt = 1; attempt <= 3; attempt++) {
       console.log(`📡 Attempt ${attempt}/3: Navigating...`);
-      await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-        waitUntil: 'networkidle2',
-        timeout: 90000
-      });
+      try {
+        await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
+          waitUntil: 'domcontentloaded', // Faster than networkidle2
+          timeout: 60000
+        });
+      } catch (e) {
+        console.log('⚠️ Navigation timeout, but proceeding to see if page loaded enough...');
+      }
 
-      // Scroll a bit to wake up any lazy loading
-      await page.evaluate(() => window.scrollBy(0, 500));
-      await new Promise(r => setTimeout(r, 2000));
-
-      console.log('🖱️ Selecting MEDICINA (M)...');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      console.log('🖱️ Selecting MEDICINA...');
       await page.evaluate(() => {
         const selects = document.querySelectorAll('select');
         for (const s of selects) {
@@ -79,44 +82,41 @@ async function runScraper() {
         return false;
       });
 
-      // IMPORTANT: Wait for the specialties to load
-      console.log('⏳ Waiting for portal to process selection...');
+      console.log('⏳ Waiting for specialties...');
       await new Promise(r => setTimeout(r, 8000));
 
-      console.log('🖱️ Clicking Consultar (Hard Click)...');
+      console.log('🖱️ Clicking Consultar...');
       await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button, a.btn'));
-        const target = btns.find(b => b.innerText.includes('Consultar') || b.textContent.includes('Consultar'));
+        const btns = Array.from(document.querySelectorAll('button, a.btn, span'));
+        const target = btns.find(b => b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar'));
         if (target) {
-          target.scrollIntoView();
-          target.click();
-          // Force another click just in case
-          setTimeout(() => target.click(), 500);
+          const actualBtn = target.closest('button') || target;
+          actualBtn.click();
           return true;
         }
         return false;
       });
 
-      console.log('⏳ Waiting for data flow...');
+      console.log('⏳ Waiting for data flow (30s max)...');
       for (let i = 0; i < 30; i++) {
         if (interceptedData) break;
         await new Promise(r => setTimeout(r, 1000));
       }
 
       if (interceptedData) break;
-      console.log('⚠️ Attempt failed. Retrying with fresh page...');
+      console.log('⚠️ No data flow detected. Refreshing...');
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Failed to capture data. The portal might be experiencing issues.');
+      console.error('❌ Data capture failed.');
       process.exit(1);
     }
 
   } catch (error) {
-    console.error('❌ Scraper error:', error.message);
+    console.error('❌ Fatal error:', error.message);
     process.exit(1);
   } finally {
     await browser.close();
@@ -138,8 +138,7 @@ async function processAndSaveData(data) {
     const p2 = `${normProv}-${normName}`;
     if (existingHospitalIds.includes(p1)) return p1;
     if (existingHospitalIds.includes(p2)) return p2;
-    const match = existingHospitalIds.find(id => id.includes(normName));
-    return match || p2;
+    return existingHospitalIds.find(id => id.includes(normName)) || p2;
   };
 
   const findBestSpecialtyId = (specName) => {
@@ -158,24 +157,23 @@ async function processAndSaveData(data) {
       const sName = item.descEspecialidad || item.descespecialidad;
       const hName = item.descCentro || item.desccentro;
       if (!sName || !hName) return null;
-      const prov = item.descProvincia || item.descprovincia;
-      const loc = item.descLocalidad || item.desclocalidad || prov;
       return {
         order_number: item.numOrden || item.numorden,
         specialty_name: sName,
         hospital_name: hName,
-        province: prov,
-        locality: loc,
+        province: item.descProvincia || item.descprovincia,
+        locality: item.descLocalidad || item.desclocalidad || item.descProvincia,
         region: item.descComunidad || item.desccomunidad,
         specialty_id: findBestSpecialtyId(sName),
-        hospital_id: findBestHospitalId(hName, prov, loc)
+        hospital_id: findBestHospitalId(hName, item.descProvincia || '', item.descLocalidad || '')
       };
     }).filter(Boolean);
+    
     const { error } = await supabase.from('adjudications').upsert(upserts, { onConflict: 'order_number' });
     if (error) console.error('❌ Upsert error:', error.message);
   }
 
-  console.log('🔄 Syncing availability...');
+  console.log('🔄 Syncing slots availability...');
   await supabase.rpc('update_available_slots');
 }
 
