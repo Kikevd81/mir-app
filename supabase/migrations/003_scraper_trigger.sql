@@ -22,7 +22,8 @@ returns trigger as $$
 begin
   update scraper_config 
   set total_adjudications_processed = (select count(*) from adjudications),
-      updated_at = now();
+      updated_at = now()
+  where id is not null;
   return null;
 end;
 $$ language plpgsql;

@@ -27,7 +27,8 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🏇 Starting "Trojan Hunter v2" MIR Scraper...');
+  console.log('🐴 Starting "Inside Trojan" MIR Scraper...');
+  console.log('   Strategy: Hijack Angular session → Direct API call');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -36,79 +37,141 @@ async function runScraper() {
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
-  await page.setCacheEnabled(false);
 
-  let bestData = [];
+  // Phase 1: Intercept the Bearer token from the Angular app's auth flow
+  let authToken = null;
+  let xsrfToken = null;
 
+  page.on('request', (request) => {
+    const headers = request.headers();
+    if (headers['authorization'] && headers['authorization'].startsWith('Bearer ')) {
+      authToken = headers['authorization'].replace('Bearer ', '');
+      console.log(`🔑 Token captured: ${authToken.substring(0, 20)}...`);
+    }
+    if (headers['x-xsrf-token']) {
+      xsrfToken = headers['x-xsrf-token'];
+      console.log(`🛡️ XSRF token captured: ${xsrfToken.substring(0, 20)}...`);
+    }
+  });
+
+  // Also listen for token in responses (from the OAuth endpoint)
   page.on('response', async (response) => {
     try {
       const url = response.url();
-      if (url.includes('api/datos') && response.status() === 200) {
-        const text = await response.text();
-        if (text && text.includes('numOrden')) {
-          const json = JSON.parse(text);
-          const data = json.data || json;
-          if (Array.isArray(data)) {
-            console.log(`🌐 Detected data packet: ${data.length} records from ${url.substring(0, 60)}...`);
-            if (data.length > bestData.length) {
-              console.log(`📈 NEW BEST: Captured ${data.length} records!`);
-              bestData = data;
-            }
-          }
+      if (url.includes('oidc/token') && response.status() === 200) {
+        const json = await response.json();
+        if (json.access_token) {
+          authToken = json.access_token;
+          console.log(`🔑 Token from OAuth: ${authToken.substring(0, 20)}...`);
         }
       }
     } catch (e) {}
   });
 
   try {
-    console.log('🏠 Visiting Home Page...');
-    await page.goto('https://fse.sanidad.gob.es/fseweb/', { waitUntil: 'networkidle2', timeout: 60000 });
-    await new Promise(r => setTimeout(r, 4000));
-
-    console.log('📡 Navigating to Adjudicaciones...');
+    // Phase 1: Let Angular boot and authenticate
+    console.log('📡 Phase 1: Loading portal and letting Angular authenticate...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 90000
     });
 
-    await new Promise(r => setTimeout(r, 6000));
+    // Wait for the app to fully initialize and make its auth calls
+    await new Promise(r => setTimeout(r, 10000));
 
-    console.log('🖱️ Selecting MEDICINA...');
-    await page.evaluate(() => {
-      const selects = document.querySelectorAll('select');
-      for (const s of selects) {
-        if (s.innerHTML.includes('MEDICINA')) {
-          s.value = 'M';
-          s.dispatchEvent(new Event('change', { bubbles: true }));
+    console.log(`🔐 Auth status: token=${authToken ? 'YES' : 'NO'}, xsrf=${xsrfToken ? 'YES' : 'NO'}`);
+
+    // Phase 2: Make direct API call from within the page context
+    console.log('🎯 Phase 2: Direct API call to getPlazasAdjudicadas...');
+    
+    const apiData = await page.evaluate(async (token, xsrf) => {
+      // Build headers exactly like the Angular app does
+      const headers = {
+        'Content-Type': 'application/json',
+        'pragma': 'no-cache',
+        'cache-control': 'no-cache'
+      };
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
+      headers['Process-Type'] = 'MENU';
+
+      // Call the API with tipoBusqueda empty (get all) and idTitulo for MEDICINA
+      const params = new URLSearchParams();
+      params.set('tipoBusqueda', '');
+      params.set('idTitulo', 'M');  // MEDICINA
+
+      const url = '/hera/api/datos/convocatoria/getPlazasAdjudicadas?' + params.toString();
+      
+      try {
+        const response = await fetch(url, { headers, credentials: 'include' });
+        if (!response.ok) {
+          return { error: `HTTP ${response.status}: ${await response.text()}` };
         }
+        const data = await response.json();
+        return { success: true, data: data, count: Array.isArray(data) ? data.length : (data.data ? data.data.length : 'unknown') };
+      } catch (e) {
+        return { error: e.message };
       }
-    });
+    }, authToken, xsrfToken);
 
-    await new Promise(r => setTimeout(r, 8000));
+    if (apiData.error) {
+      console.log(`⚠️ First attempt failed: ${apiData.error}`);
+      console.log('🔄 Trying alternative: getPlazasAdjudicadasTotal...');
+      
+      // Try the Total endpoint
+      const totalData = await page.evaluate(async (token, xsrf) => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'pragma': 'no-cache',
+          'cache-control': 'no-cache'
+        };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
+        headers['Process-Type'] = 'MENU';
 
-    console.log('⌨️ Clicking Consultar...');
-    await page.keyboard.press('Tab');
-    await page.keyboard.press('Enter');
-    await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, a, span, div, i'));
-      btns.forEach(b => {
-        if (b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar')) b.click();
-      });
-    });
-
-    console.log('⏳ Monitoring data flow (45s)...');
-    for (let i = 0; i < 45; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      // If we already have a very large dataset, we can stop earlier
-      if (bestData.length > 2000) break; 
-    }
-
-    if (bestData.length > 0) {
-      await processAndSaveData(bestData);
-      console.log('🏁 Scraper finished successfully!');
+        try {
+          // Try multiple endpoints
+          const endpoints = [
+            '/hera/api/datos/convocatoria/getPlazasAdjudicadasTotal',
+            '/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=plazaCentro&idTitulo=M',
+            '/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M',
+            '/hera/api/datos/convocatoria/getPlazasAdjudicadas'
+          ];
+          
+          for (const endpoint of endpoints) {
+            const response = await fetch(endpoint, { headers, credentials: 'include' });
+            if (response.ok) {
+              const data = await response.json();
+              const records = Array.isArray(data) ? data : (data.data || data);
+              if (Array.isArray(records) && records.length > 0) {
+                return { success: true, data: records, endpoint };
+              }
+            }
+          }
+          return { error: 'All endpoints returned empty or failed' };
+        } catch (e) {
+          return { error: e.message };
+        }
+      }, authToken, xsrfToken);
+      
+      if (totalData.success) {
+        console.log(`✅ Got ${totalData.data.length} records from ${totalData.endpoint}`);
+        await processAndSaveData(totalData.data);
+        console.log('🏁 Scraper finished successfully!');
+      } else {
+        console.error(`❌ All API attempts failed: ${totalData.error}`);
+        process.exit(1);
+      }
     } else {
-      console.error('❌ No data captured.');
-      process.exit(1);
+      const records = Array.isArray(apiData.data) ? apiData.data : (apiData.data?.data || apiData.data);
+      if (Array.isArray(records) && records.length > 0) {
+        console.log(`✅ Got ${records.length} records from primary endpoint`);
+        await processAndSaveData(records);
+        console.log('🏁 Scraper finished successfully!');
+      } else {
+        console.log(`⚠️ API returned data but no records array. Response shape: ${JSON.stringify(apiData).substring(0, 200)}`);
+        process.exit(1);
+      }
     }
 
   } catch (error) {
@@ -120,40 +183,68 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Upserting ${data.length} records to Supabase...`);
+  console.log(`📊 Processing ${data.length} records...`);
   const { data: specialties } = await supabase.from('specialties').select('*');
-  const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
+  const specialtyMap = new Map((specialties || []).map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
-  const existingHospitalIds = [...new Set(existingSlots.map(s => s.hospital_id))];
+  const existingHospitalIds = [...new Set((existingSlots || []).map(s => s.hospital_id))];
 
   const findBestHospitalId = (hospName, province, locality) => {
     const normName = normalizeText(hospName);
-    const p1 = `${normalizeText(province)}-${normalizeText(locality)}-${normName}`;
     const p2 = `${normalizeText(province)}-${normName}`;
-    return existingHospitalIds.includes(p1) ? p1 : (existingHospitalIds.includes(p2) ? p2 : p2);
+    return existingHospitalIds.includes(p2) ? p2 : p2;
   };
 
   const upserts = data.map(item => {
-    const sName = item.descEspecialidad || item.descespecialidad;
-    const hName = item.descCentro || item.desccentro;
+    const sName = item.desespec || item.descEspecialidad;
+    const hName = item.descentro || item.descCentro;
     if (!sName || !hName) return null;
+
+    const province = item.despro || item.descProvincia || '';
+    
     return {
-      order_number: item.numOrden || item.numorden,
+      order_number: parseInt(item.numorden || item.numOrden),
       specialty_name: sName,
       hospital_name: hName,
-      province: item.descProvincia || item.descprovincia,
-      locality: item.descLocalidad || item.desclocalidad || item.descProvincia,
-      region: item.descComunidad || item.desccomunidad,
+      province: province,
       specialty_id: specialtyMap.get(sName.toLowerCase()) || generateId(sName),
-      hospital_id: findBestHospitalId(hName, item.descProvincia || '', item.descLocalidad || '')
+      hospital_id: findBestHospitalId(hName, province, '')
     };
   }).filter(Boolean);
 
-  const BATCH_SIZE = 250;
+  console.log(`   Valid records to upsert: ${upserts.length}`);
+  const BATCH_SIZE = 50;
+  let successCount = 0;
+
   for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
-    await supabase.from('adjudications').upsert(upserts.slice(i, i + BATCH_SIZE), { onConflict: 'order_number' });
+    const batch = upserts.slice(i, i + BATCH_SIZE);
+    const { error } = await supabase.from('adjudications').upsert(batch, { onConflict: 'order_number' });
+
+    if (error) {
+      console.error(`   ❌ Batch ${i / BATCH_SIZE + 1} failed: ${error.message}`);
+      if (error.message.includes('WHERE clause')) {
+        console.error('   ⚠️ DATABASE BLOCK: A trigger in your Supabase database is preventing updates.');
+        console.error('   👉 FIX: Apply the updated SQL in 003_scraper_trigger.sql to your Supabase SQL Editor.');
+        break; 
+      }
+    } else {
+      console.log(`   ✅ Batch ${i / BATCH_SIZE + 1}: ${batch.length} records OK`);
+      successCount += batch.length;
+    }
   }
-  await supabase.rpc('update_available_slots');
+
+  if (successCount > 0) {
+    try {
+      await supabase.rpc('update_available_slots');
+      console.log('   ✅ Available slots updated in database!');
+    } catch (e) {
+      console.error('   ⚠️ RPC error updating slots:', e.message);
+    }
+    console.log(`🚀 Total records processed: ${successCount}`);
+  }
 }
 
 runScraper();
+
+
+
