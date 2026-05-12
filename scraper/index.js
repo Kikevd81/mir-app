@@ -24,7 +24,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "God Mode" MIR Scraper...');
+  console.log('🚀 Starting "Brute Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -32,70 +32,77 @@ async function runScraper() {
   });
 
   const page = await browser.newPage();
-  let authToken = null;
+  await page.setViewport({ width: 1920, height: 1080 });
 
-  // Intercept headers to grab the Authorization token
-  await page.setRequestInterception(true);
-  page.on('request', (request) => {
-    const headers = request.headers();
-    if (headers['authorization'] || headers['Authorization']) {
-      authToken = headers['authorization'] || headers['Authorization'];
+  let interceptedData = null;
+
+  page.on('response', async (response) => {
+    const url = response.url();
+    if (url.includes('api/datos') && response.status() === 200) {
+      try {
+        const text = await response.text();
+        if (text && text.includes('numOrden') && text.length > 50000) {
+          const json = JSON.parse(text);
+          const data = json.data || json;
+          if (Array.isArray(data) && data.length > 500) {
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records!`);
+            interceptedData = data;
+          }
+        }
+      } catch (e) {}
     }
-    request.continue();
   });
 
   try {
     console.log('📡 Navigating to Portal...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-      waitUntil: 'networkidle0',
+      waitUntil: 'networkidle2',
       timeout: 60000
     });
 
-    // Wait for a token to appear
-    console.log('⏳ Waiting for security token...');
-    for (let i = 0; i < 20; i++) {
-      if (authToken) break;
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    if (!authToken) {
-      console.log('⚠️ No token found automatically. Forcing selection...');
-      await page.evaluate(() => {
-        const selects = document.querySelectorAll('select');
-        for (const s of selects) {
-          if (s.innerHTML.includes('MEDICINA')) {
-            s.value = 'M';
-            s.dispatchEvent(new Event('change', { bubbles: true }));
-          }
+    console.log('🖱️ Selecting MEDICINA...');
+    await page.evaluate(() => {
+      const selects = document.querySelectorAll('select');
+      for (const s of selects) {
+        if (s.innerHTML.includes('MEDICINA')) {
+          s.value = 'M';
+          s.dispatchEvent(new Event('change', { bubbles: true }));
         }
-      });
-      await new Promise(r => setTimeout(r, 5000));
-    }
-
-    if (authToken) {
-      console.log('🔑 Token captured! Forcing internal fetch...');
-      const data = await page.evaluate(async (token) => {
-        try {
-          const response = await fetch('https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas/listadosInicialPlazas', {
-            headers: { 'Authorization': token }
-          });
-          const json = await response.json();
-          return json.data || json;
-        } catch (e) {
-          return null;
-        }
-      }, authToken);
-
-      if (data && Array.isArray(data) && data.length > 100) {
-        console.log(`🎯 SUCCESS: Extracted ${data.length} records!`);
-        await processAndSaveData(data);
-        console.log('🏁 Scraper finished successfully!');
-      } else {
-        console.error('❌ Internal fetch failed or returned no data.');
-        process.exit(1);
       }
+    });
+
+    await new Promise(r => setTimeout(r, 5000));
+
+    console.log('🔄 Performing Scroll & Click cycles...');
+    for (let i = 0; i < 5; i++) {
+      if (interceptedData) break;
+      
+      console.log(`🌀 Cycle ${i+1}: Scrolling and searching for Consultar...`);
+      await page.evaluate(() => window.scrollBy(0, 300));
+      await new Promise(r => setTimeout(r, 1000));
+      
+      const clicked = await page.evaluate(() => {
+        const elements = Array.from(document.querySelectorAll('button, a, span, div, i'));
+        const target = elements.find(el => 
+          (el.innerText?.includes('Consultar') || el.textContent?.includes('Consultar')) &&
+          el.getBoundingClientRect().width > 0
+        );
+        if (target) {
+          target.click();
+          return true;
+        }
+        return false;
+      });
+
+      if (clicked) console.log('✅ Clicked "Consultar"');
+      await new Promise(r => setTimeout(r, 4000));
+    }
+
+    if (interceptedData) {
+      await processAndSaveData(interceptedData);
+      console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Could not capture security token.');
+      console.error('❌ Data capture failed.');
       process.exit(1);
     }
 
