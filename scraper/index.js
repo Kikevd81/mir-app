@@ -1,6 +1,9 @@
 require('dotenv').config({ path: '../.env' });
 const { createClient } = require('@supabase/supabase-js');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+puppeteer.use(StealthPlugin());
 
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
 const supabaseKey = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY;
@@ -24,11 +27,11 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Blind Hunter" MIR Scraper...');
+  console.log('🕵️ Starting "Stealth Infiltrator" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1920,1080']
   });
 
   const page = await browser.newPage();
@@ -41,12 +44,11 @@ async function runScraper() {
     if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
-        // ANY large file with 'numOrden' is our target
-        if (text && text.includes('numOrden') && text.length > 30000) {
+        if (text && text.includes('numOrden') && text.length > 50000) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.length > 100) {
-            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records from ${url.substring(0, 50)}...`);
+          if (Array.isArray(data)) {
+            console.log(`🎯 SUCCESS: Captured ${data.length} records!`);
             interceptedData = data;
           }
         }
@@ -55,13 +57,13 @@ async function runScraper() {
   });
 
   try {
-    console.log('📡 Navigating to Portal...');
+    console.log('📡 Navigating to Portal (Stealth Mode)...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 90000
     });
 
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 4000));
 
     console.log('🖱️ Selecting MEDICINA...');
     await page.evaluate(() => {
@@ -74,21 +76,20 @@ async function runScraper() {
       }
     });
 
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 6000));
 
-    console.log('🔄 Brute-forcing all buttons...');
+    console.log('🖱️ Searching and clicking "Consultar"...');
     await page.evaluate(() => {
-      // Click everything that looks like a button or a search link
-      const clickable = document.querySelectorAll('button, a, .btn, [role="button"]');
-      clickable.forEach(el => {
-        if (el.innerText?.includes('Consultar') || el.textContent?.includes('Consultar') || el.innerHTML.includes('search')) {
-          el.click();
-        }
-      });
+      const btns = Array.from(document.querySelectorAll('button, a, span, div'));
+      const target = btns.find(b => b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar'));
+      if (target) {
+        target.scrollIntoView();
+        target.click();
+      }
     });
 
-    console.log('⏳ Waiting for data flow...');
-    for (let i = 0; i < 30; i++) {
+    console.log('⏳ Waiting for data flow (up to 60s)...');
+    for (let i = 0; i < 60; i++) {
       if (interceptedData) break;
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -97,9 +98,7 @@ async function runScraper() {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.log('❌ No data captured. Taking debug screenshot...');
-      await page.screenshot({ path: 'debug_portal.png' });
-      console.log('📸 Screenshot saved as debug_portal.png. Check artifacts if possible.');
+      console.error('❌ Data capture failed even in Stealth Mode.');
       process.exit(1);
     }
 
@@ -112,7 +111,8 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Saving ${data.length} records...`);
+  console.log(`📊 Saving ${data.length} records to Supabase...`);
+  // Reusing the robust mapping logic
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
