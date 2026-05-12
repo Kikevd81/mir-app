@@ -24,43 +24,29 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "X-Ray Hunter" MIR Scraper...');
+  console.log('🚀 Starting "Invisible Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
-    args: [
-      '--no-sandbox', 
-      '--disable-setuid-sandbox', 
-      '--disable-dev-shm-usage', 
-      '--window-size=1920,1080',
-      '--disable-web-security' // Help with some intercept issues
-    ]
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
   let interceptedData = null;
 
-  // X-Ray Logging: Print ALL data-related URLs to debug in GitHub Actions
-  page.on('request', request => {
-    const url = request.url();
-    if (url.includes('api/datos')) {
-      console.log(`🌐 Request detected: ${url}`);
-    }
-  });
-
   page.on('response', async (response) => {
     const url = response.url();
-    if (url.includes('api/datos') && response.status() === 200) {
+    // Capture either the initial list or the specific medicine list
+    if ((url.includes('listadosInicialPlazas') || url.includes('listados/M')) && response.status() === 200) {
       try {
         const text = await response.text();
-        if (text && text.includes('numOrden')) {
+        if (text && text.length > 5000) {
           const json = JSON.parse(text);
           const data = json.data || json;
           if (Array.isArray(data) && data.length > 100) {
-            console.log(`🎯 TARGET ACQUIRED! Captured ${data.length} records.`);
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records from ${url}`);
             interceptedData = data;
           }
         }
@@ -69,65 +55,35 @@ async function runScraper() {
   });
 
   try {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      console.log(`📡 Attempt ${attempt}/2: Navigating...`);
-      await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-        waitUntil: 'networkidle0', // Wait for all requests to finish
-        timeout: 60000
-      });
+    console.log('📡 Navigating to Portal...');
+    await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
+      waitUntil: 'networkidle2',
+      timeout: 60000
+    });
 
-      await new Promise(r => setTimeout(r, 5000));
-      
-      console.log('🖱️ Selecting MEDICINA...');
-      await page.evaluate(() => {
-        const selects = document.querySelectorAll('select');
-        for (const s of selects) {
-          if (s.innerHTML.includes('MEDICINA')) {
-            s.value = 'M';
-            s.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          }
+    // Just in case it needs the selection to trigger the RIGHT data
+    console.log('🖱️ Selecting MEDICINA to ensure data flow...');
+    await page.evaluate(() => {
+      const selects = document.querySelectorAll('select');
+      for (const s of selects) {
+        if (s.innerHTML.includes('MEDICINA')) {
+          s.value = 'M';
+          s.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        return false;
-      });
-
-      console.log('⏳ Waiting for UI to update (10s)...');
-      await new Promise(r => setTimeout(r, 10000));
-
-      console.log('🖱️ Clicking Consultar (Physical Click Simulation)...');
-      const clicked = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button, a.btn, span, div.btn'));
-        const target = btns.find(b => b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar'));
-        if (target) {
-          target.scrollIntoView();
-          const rect = target.getBoundingClientRect();
-          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-        }
-        return null;
-      });
-
-      if (clicked) {
-        await page.mouse.click(clicked.x, clicked.y);
-        console.log(`✅ Mouse clicked at ${clicked.x}, ${clicked.y}`);
-      } else {
-        console.log('⚠️ Could not find Consultar button with current selectors.');
       }
+    });
 
-      console.log('⏳ Watching network for the data packet...');
-      for (let i = 0; i < 40; i++) {
-        if (interceptedData) break;
-        await new Promise(r => setTimeout(r, 1000));
-      }
-
+    console.log('⏳ Waiting 30s for data packets to arrive...');
+    for (let i = 0; i < 30; i++) {
       if (interceptedData) break;
-      console.log('⚠️ Attempt failed. The data did not flow.');
+      await new Promise(r => setTimeout(r, 1000));
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Data capture failed. Check the logs for "🌐 Request detected" to see which URLs were called.');
+      console.error('❌ Data capture failed. No packets detected.');
       process.exit(1);
     }
 
@@ -140,10 +96,11 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Saving ${data.length} records to Supabase...`);
-  // Mapping logic is already tested and working, reusing it...
+  console.log(`📊 Processing ${data.length} records...`);
+  
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
+
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
   const existingHospitalIds = [...new Set(existingSlots.map(s => s.hospital_id))];
 
@@ -151,7 +108,9 @@ async function processAndSaveData(data) {
     const normName = normalizeText(hospName);
     const p1 = `${normalizeText(province)}-${normalizeText(locality)}-${normName}`;
     const p2 = `${normalizeText(province)}-${normName}`;
-    return existingHospitalIds.includes(p1) ? p1 : (existingHospitalIds.includes(p2) ? p2 : p2);
+    if (existingHospitalIds.includes(p1)) return p1;
+    if (existingHospitalIds.includes(p2)) return p2;
+    return existingHospitalIds.find(id => id.includes(normName)) || p2;
   };
 
   const findBestSpecialtyId = (specName) => {
@@ -181,7 +140,7 @@ async function processAndSaveData(data) {
     if (error) console.error('❌ Upsert error:', error.message);
   }
 
-  console.log('🔄 Triggering availability update...');
+  console.log('🔄 Syncing slots...');
   await supabase.rpc('update_available_slots');
 }
 
