@@ -27,7 +27,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🏇 Starting "Trojan Hunter" MIR Scraper...');
+  console.log('🏇 Starting "Trojan Hunter v2" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -38,7 +38,7 @@ async function runScraper() {
   await page.setViewport({ width: 1920, height: 1080 });
   await page.setCacheEnabled(false);
 
-  let interceptedData = null;
+  let bestData = [];
 
   page.on('response', async (response) => {
     try {
@@ -48,9 +48,12 @@ async function runScraper() {
         if (text && text.includes('numOrden')) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.length > 100) {
-            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records!`);
-            interceptedData = data;
+          if (Array.isArray(data)) {
+            console.log(`🌐 Detected data packet: ${data.length} records from ${url.substring(0, 60)}...`);
+            if (data.length > bestData.length) {
+              console.log(`📈 NEW BEST: Captured ${data.length} records!`);
+              bestData = data;
+            }
           }
         }
       }
@@ -58,17 +61,17 @@ async function runScraper() {
   });
 
   try {
-    console.log('🏠 Visiting Home Page to get cookies...');
+    console.log('🏠 Visiting Home Page...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/', { waitUntil: 'networkidle2', timeout: 60000 });
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 4000));
 
-    console.log('📡 Jumping to Adjudicaciones page...');
+    console.log('📡 Navigating to Adjudicaciones...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
       waitUntil: 'networkidle2',
       timeout: 60000
     });
 
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 6000));
 
     console.log('🖱️ Selecting MEDICINA...');
     await page.evaluate(() => {
@@ -81,32 +84,30 @@ async function runScraper() {
       }
     });
 
-    await new Promise(r => setTimeout(r, 10000));
+    await new Promise(r => setTimeout(r, 8000));
 
-    console.log('⌨️ Brute-forcing "Consultar" with Keyboard and All Clicks...');
+    console.log('⌨️ Clicking Consultar...');
     await page.keyboard.press('Tab');
     await page.keyboard.press('Enter');
-    
     await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('button, a, span, div, i'));
       btns.forEach(b => {
-        if (b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar')) {
-          b.click();
-        }
+        if (b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar')) b.click();
       });
     });
 
-    console.log('⏳ Waiting for data flow (60s)...');
-    for (let i = 0; i < 60; i++) {
-      if (interceptedData) break;
+    console.log('⏳ Monitoring data flow (45s)...');
+    for (let i = 0; i < 45; i++) {
       await new Promise(r => setTimeout(r, 1000));
+      // If we already have a very large dataset, we can stop earlier
+      if (bestData.length > 2000) break; 
     }
 
-    if (interceptedData) {
-      await processAndSaveData(interceptedData);
+    if (bestData.length > 0) {
+      await processAndSaveData(bestData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Data capture failed.');
+      console.error('❌ No data captured.');
       process.exit(1);
     }
 
@@ -119,7 +120,7 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Saving ${data.length} records...`);
+  console.log(`📊 Upserting ${data.length} records to Supabase...`);
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
@@ -148,7 +149,7 @@ async function processAndSaveData(data) {
     };
   }).filter(Boolean);
 
-  const BATCH_SIZE = 200;
+  const BATCH_SIZE = 250;
   for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
     await supabase.from('adjudications').upsert(upserts.slice(i, i + BATCH_SIZE), { onConflict: 'order_number' });
   }
