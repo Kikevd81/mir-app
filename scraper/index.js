@@ -24,27 +24,24 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Hunter" MIR Scraper...');
+  console.log('🚀 Starting "Ultra Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
   });
 
   const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 800 });
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  await page.setViewport({ width: 1920, height: 1080 });
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
 
   let interceptedData = null;
 
-  // Passive hunter: listen for any large JSON response
   page.on('response', async (response) => {
     const url = response.url();
-    // Look for URLs that likely contain the adjudications list
     if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
-        // The real adjudication list is VERY large (>100KB) and MUST contain 'numOrden'
         if (text && text.includes('numOrden') && text.length > 50000) {
           const json = JSON.parse(text);
           const data = json.data || json;
@@ -53,62 +50,68 @@ async function runScraper() {
             interceptedData = data;
           }
         }
-      } catch (e) {
-        // Silent fail
-      }
+      } catch (e) {}
     }
   });
 
   try {
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      console.log(`📡 Attempt ${attempt}/5: Navigating to Ministry Portal...`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`📡 Attempt ${attempt}/3: Navigating...`);
       await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
         waitUntil: 'networkidle2',
-        timeout: 60000
+        timeout: 90000
       });
 
-      console.log('🖱️ Selecting MEDICINA...');
-      await page.evaluate(async () => {
+      // Scroll a bit to wake up any lazy loading
+      await page.evaluate(() => window.scrollBy(0, 500));
+      await new Promise(r => setTimeout(r, 2000));
+
+      console.log('🖱️ Selecting MEDICINA (M)...');
+      await page.evaluate(() => {
         const selects = document.querySelectorAll('select');
         for (const s of selects) {
-          if (s.innerText.includes('MEDICINA') || s.innerHTML.includes('MEDICINA')) {
-            s.value = s.options[1].value;
-            s.dispatchEvent(new Event('change'));
+          if (s.innerHTML.includes('MEDICINA')) {
+            s.value = 'M';
+            s.dispatchEvent(new Event('change', { bubbles: true }));
             return true;
           }
         }
         return false;
       });
 
-      await new Promise(r => setTimeout(r, 3000));
+      // IMPORTANT: Wait for the specialties to load
+      console.log('⏳ Waiting for portal to process selection...');
+      await new Promise(r => setTimeout(r, 8000));
 
-      console.log('🖱️ Clicking Consultar...');
+      console.log('🖱️ Clicking Consultar (Hard Click)...');
       await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
+        const btns = Array.from(document.querySelectorAll('button, a.btn'));
         const target = btns.find(b => b.innerText.includes('Consultar') || b.textContent.includes('Consultar'));
         if (target) {
+          target.scrollIntoView();
           target.click();
+          // Force another click just in case
+          setTimeout(() => target.click(), 500);
           return true;
         }
         return false;
       });
 
-      // Wait up to 20 seconds for the hunter to catch the data
-      console.log('⏳ Waiting for data to flow...');
-      for (let i = 0; i < 20; i++) {
+      console.log('⏳ Waiting for data flow...');
+      for (let i = 0; i < 30; i++) {
         if (interceptedData) break;
         await new Promise(r => setTimeout(r, 1000));
       }
 
       if (interceptedData) break;
-      console.log('⚠️ No data captured in this attempt. Retrying...');
+      console.log('⚠️ Attempt failed. Retrying with fresh page...');
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Failed to capture data after 5 attempts. The Ministry portal might be under heavy load.');
+      console.error('❌ Failed to capture data. The portal might be experiencing issues.');
       process.exit(1);
     }
 
@@ -122,10 +125,8 @@ async function runScraper() {
 
 async function processAndSaveData(data) {
   console.log(`📊 Processing ${data.length} records...`);
-  
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
-
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
   const existingHospitalIds = [...new Set(existingSlots.map(s => s.hospital_id))];
 
@@ -133,15 +134,10 @@ async function processAndSaveData(data) {
     const normName = normalizeText(hospName);
     const normProv = normalizeText(province);
     const normLoc = normalizeText(locality);
-    
-    // Exact match patterns
     const p1 = `${normProv}-${normLoc}-${normName}`;
     const p2 = `${normProv}-${normName}`;
-    
     if (existingHospitalIds.includes(p1)) return p1;
     if (existingHospitalIds.includes(p2)) return p2;
-    
-    // Fuzzy search
     const match = existingHospitalIds.find(id => id.includes(normName));
     return match || p2;
   };
@@ -161,11 +157,9 @@ async function processAndSaveData(data) {
     const upserts = batch.map(item => {
       const sName = item.descEspecialidad || item.descespecialidad;
       const hName = item.descCentro || item.desccentro;
+      if (!sName || !hName) return null;
       const prov = item.descProvincia || item.descprovincia;
       const loc = item.descLocalidad || item.desclocalidad || prov;
-
-      if (!sName || !hName) return null; // Skip malformed items
-
       return {
         order_number: item.numOrden || item.numorden,
         specialty_name: sName,
@@ -176,15 +170,13 @@ async function processAndSaveData(data) {
         specialty_id: findBestSpecialtyId(sName),
         hospital_id: findBestHospitalId(hName, prov, loc)
       };
-    }).filter(x => x !== null);
-
+    }).filter(Boolean);
     const { error } = await supabase.from('adjudications').upsert(upserts, { onConflict: 'order_number' });
     if (error) console.error('❌ Upsert error:', error.message);
   }
 
-  console.log('🔄 Sincronizando disponibilidad...');
-  const { error: rpcError } = await supabase.rpc('update_available_slots');
-  if (rpcError) console.error('❌ RPC Error:', rpcError.message);
+  console.log('🔄 Syncing availability...');
+  await supabase.rpc('update_available_slots');
 }
 
 runScraper();
