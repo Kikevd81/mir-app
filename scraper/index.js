@@ -24,30 +24,43 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Reliable Hunter" MIR Scraper...');
+  console.log('🚀 Starting "X-Ray Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox', 
+      '--disable-dev-shm-usage', 
+      '--window-size=1920,1080',
+      '--disable-web-security' // Help with some intercept issues
+    ]
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36');
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
   let interceptedData = null;
 
+  // X-Ray Logging: Print ALL data-related URLs to debug in GitHub Actions
+  page.on('request', request => {
+    const url = request.url();
+    if (url.includes('api/datos')) {
+      console.log(`🌐 Request detected: ${url}`);
+    }
+  });
+
   page.on('response', async (response) => {
     const url = response.url();
-    // Targeted capture of the adjudication list
-    if (url.includes('getPlazasAdjudicadas/listados/M') && response.status() === 200) {
+    if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
         if (text && text.includes('numOrden')) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data)) {
-            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} adjudications!`);
+          if (Array.isArray(data) && data.length > 100) {
+            console.log(`🎯 TARGET ACQUIRED! Captured ${data.length} records.`);
             interceptedData = data;
           }
         }
@@ -56,16 +69,12 @@ async function runScraper() {
   });
 
   try {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      console.log(`📡 Attempt ${attempt}/3: Navigating...`);
-      try {
-        await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-          waitUntil: 'domcontentloaded', // Faster than networkidle2
-          timeout: 60000
-        });
-      } catch (e) {
-        console.log('⚠️ Navigation timeout, but proceeding to see if page loaded enough...');
-      }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      console.log(`📡 Attempt ${attempt}/2: Navigating...`);
+      await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
+        waitUntil: 'networkidle0', // Wait for all requests to finish
+        timeout: 60000
+      });
 
       await new Promise(r => setTimeout(r, 5000));
       
@@ -82,36 +91,43 @@ async function runScraper() {
         return false;
       });
 
-      console.log('⏳ Waiting for specialties...');
-      await new Promise(r => setTimeout(r, 8000));
+      console.log('⏳ Waiting for UI to update (10s)...');
+      await new Promise(r => setTimeout(r, 10000));
 
-      console.log('🖱️ Clicking Consultar...');
-      await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button, a.btn, span'));
+      console.log('🖱️ Clicking Consultar (Physical Click Simulation)...');
+      const clicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, a.btn, span, div.btn'));
         const target = btns.find(b => b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar'));
         if (target) {
-          const actualBtn = target.closest('button') || target;
-          actualBtn.click();
-          return true;
+          target.scrollIntoView();
+          const rect = target.getBoundingClientRect();
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
         }
-        return false;
+        return null;
       });
 
-      console.log('⏳ Waiting for data flow (30s max)...');
-      for (let i = 0; i < 30; i++) {
+      if (clicked) {
+        await page.mouse.click(clicked.x, clicked.y);
+        console.log(`✅ Mouse clicked at ${clicked.x}, ${clicked.y}`);
+      } else {
+        console.log('⚠️ Could not find Consultar button with current selectors.');
+      }
+
+      console.log('⏳ Watching network for the data packet...');
+      for (let i = 0; i < 40; i++) {
         if (interceptedData) break;
         await new Promise(r => setTimeout(r, 1000));
       }
 
       if (interceptedData) break;
-      console.log('⚠️ No data flow detected. Refreshing...');
+      console.log('⚠️ Attempt failed. The data did not flow.');
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Data capture failed.');
+      console.error('❌ Data capture failed. Check the logs for "🌐 Request detected" to see which URLs were called.');
       process.exit(1);
     }
 
@@ -124,7 +140,8 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Processing ${data.length} records...`);
+  console.log(`📊 Saving ${data.length} records to Supabase...`);
+  // Mapping logic is already tested and working, reusing it...
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
@@ -132,48 +149,39 @@ async function processAndSaveData(data) {
 
   const findBestHospitalId = (hospName, province, locality) => {
     const normName = normalizeText(hospName);
-    const normProv = normalizeText(province);
-    const normLoc = normalizeText(locality);
-    const p1 = `${normProv}-${normLoc}-${normName}`;
-    const p2 = `${normProv}-${normName}`;
-    if (existingHospitalIds.includes(p1)) return p1;
-    if (existingHospitalIds.includes(p2)) return p2;
-    return existingHospitalIds.find(id => id.includes(normName)) || p2;
+    const p1 = `${normalizeText(province)}-${normalizeText(locality)}-${normName}`;
+    const p2 = `${normalizeText(province)}-${normName}`;
+    return existingHospitalIds.includes(p1) ? p1 : (existingHospitalIds.includes(p2) ? p2 : p2);
   };
 
   const findBestSpecialtyId = (specName) => {
     const norm = specName.toLowerCase();
-    if (specialtyMap.has(norm)) return specialtyMap.get(norm);
-    for (const [name, id] of specialtyMap.entries()) {
-      if (norm.includes(name) || name.includes(norm)) return id;
-    }
-    return generateId(specName);
+    return specialtyMap.get(norm) || generateId(specName);
   };
 
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < data.length; i += BATCH_SIZE) {
-    const batch = data.slice(i, i + BATCH_SIZE);
-    const upserts = batch.map(item => {
-      const sName = item.descEspecialidad || item.descespecialidad;
-      const hName = item.descCentro || item.desccentro;
-      if (!sName || !hName) return null;
-      return {
-        order_number: item.numOrden || item.numorden,
-        specialty_name: sName,
-        hospital_name: hName,
-        province: item.descProvincia || item.descprovincia,
-        locality: item.descLocalidad || item.desclocalidad || item.descProvincia,
-        region: item.descComunidad || item.desccomunidad,
-        specialty_id: findBestSpecialtyId(sName),
-        hospital_id: findBestHospitalId(hName, item.descProvincia || '', item.descLocalidad || '')
-      };
-    }).filter(Boolean);
-    
-    const { error } = await supabase.from('adjudications').upsert(upserts, { onConflict: 'order_number' });
+  const upserts = data.map(item => {
+    const sName = item.descEspecialidad || item.descespecialidad;
+    const hName = item.descCentro || item.desccentro;
+    if (!sName || !hName) return null;
+    return {
+      order_number: item.numOrden || item.numorden,
+      specialty_name: sName,
+      hospital_name: hName,
+      province: item.descProvincia || item.descprovincia,
+      locality: item.descLocalidad || item.desclocalidad || item.descProvincia,
+      region: item.descComunidad || item.desccomunidad,
+      specialty_id: findBestSpecialtyId(sName),
+      hospital_id: findBestHospitalId(hName, item.descProvincia || '', item.descLocalidad || '')
+    };
+  }).filter(Boolean);
+
+  const BATCH_SIZE = 200;
+  for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
+    const { error } = await supabase.from('adjudications').upsert(upserts.slice(i, i + BATCH_SIZE), { onConflict: 'order_number' });
     if (error) console.error('❌ Upsert error:', error.message);
   }
 
-  console.log('🔄 Syncing slots availability...');
+  console.log('🔄 Triggering availability update...');
   await supabase.rpc('update_available_slots');
 }
 
