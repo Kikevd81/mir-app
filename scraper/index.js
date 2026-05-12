@@ -24,7 +24,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Brute Hunter" MIR Scraper...');
+  console.log('🚀 Starting "Blind Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -41,11 +41,12 @@ async function runScraper() {
     if (url.includes('api/datos') && response.status() === 200) {
       try {
         const text = await response.text();
-        if (text && text.includes('numOrden') && text.length > 50000) {
+        // ANY large file with 'numOrden' is our target
+        if (text && text.includes('numOrden') && text.length > 30000) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.length > 500) {
-            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records!`);
+          if (Array.isArray(data) && data.length > 100) {
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records from ${url.substring(0, 50)}...`);
             interceptedData = data;
           }
         }
@@ -60,6 +61,8 @@ async function runScraper() {
       timeout: 60000
     });
 
+    await new Promise(r => setTimeout(r, 5000));
+
     console.log('🖱️ Selecting MEDICINA...');
     await page.evaluate(() => {
       const selects = document.querySelectorAll('select');
@@ -73,36 +76,30 @@ async function runScraper() {
 
     await new Promise(r => setTimeout(r, 5000));
 
-    console.log('🔄 Performing Scroll & Click cycles...');
-    for (let i = 0; i < 5; i++) {
-      if (interceptedData) break;
-      
-      console.log(`🌀 Cycle ${i+1}: Scrolling and searching for Consultar...`);
-      await page.evaluate(() => window.scrollBy(0, 300));
-      await new Promise(r => setTimeout(r, 1000));
-      
-      const clicked = await page.evaluate(() => {
-        const elements = Array.from(document.querySelectorAll('button, a, span, div, i'));
-        const target = elements.find(el => 
-          (el.innerText?.includes('Consultar') || el.textContent?.includes('Consultar')) &&
-          el.getBoundingClientRect().width > 0
-        );
-        if (target) {
-          target.click();
-          return true;
+    console.log('🔄 Brute-forcing all buttons...');
+    await page.evaluate(() => {
+      // Click everything that looks like a button or a search link
+      const clickable = document.querySelectorAll('button, a, .btn, [role="button"]');
+      clickable.forEach(el => {
+        if (el.innerText?.includes('Consultar') || el.textContent?.includes('Consultar') || el.innerHTML.includes('search')) {
+          el.click();
         }
-        return false;
       });
+    });
 
-      if (clicked) console.log('✅ Clicked "Consultar"');
-      await new Promise(r => setTimeout(r, 4000));
+    console.log('⏳ Waiting for data flow...');
+    for (let i = 0; i < 30; i++) {
+      if (interceptedData) break;
+      await new Promise(r => setTimeout(r, 1000));
     }
 
     if (interceptedData) {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Data capture failed.');
+      console.log('❌ No data captured. Taking debug screenshot...');
+      await page.screenshot({ path: 'debug_portal.png' });
+      console.log('📸 Screenshot saved as debug_portal.png. Check artifacts if possible.');
       process.exit(1);
     }
 
@@ -115,7 +112,7 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Processing ${data.length} records...`);
+  console.log(`📊 Saving ${data.length} records...`);
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
