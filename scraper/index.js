@@ -24,7 +24,7 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🚀 Starting "Stealth" MIR Scraper...');
+  console.log('🚀 Starting "Token Extraction" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
@@ -35,24 +35,32 @@ async function runScraper() {
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
   let interceptedData = null;
+  let authHeader = null;
 
-  // Intercept all requests to find the one with numOrden
+  // Intercept requests to steal the Authorization header
+  await page.setRequestInterception(true);
+  page.on('request', (request) => {
+    const headers = request.headers();
+    if (headers['authorization'] || headers['Authorization']) {
+      authHeader = headers['authorization'] || headers['Authorization'];
+    }
+    request.continue();
+  });
+
+  // Intercept responses as a backup
   page.on('response', async (response) => {
     const url = response.url();
-    if (url.includes('listadosInicialPlazas') || url.includes('listadosInicial') || url.includes('getPlazasAdjudicadas')) {
+    if (url.includes('listadosInicialPlazas') || url.includes('listadosInicial')) {
       try {
         const text = await response.text();
-        if (text && text.length > 1000) { // Large enough to be the real data
+        if (text && text.length > 5000) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data) && data.some(d => d.numOrden || d.numorden)) {
-            console.log(`✅ SUCCESS: Intercepted data with ${data.length} records!`);
+          if (Array.isArray(data) && data.length > 100) {
             interceptedData = data;
           }
         }
-      } catch (e) {
-        // Skip errors
-      }
+      } catch (e) {}
     }
   });
 
@@ -63,56 +71,51 @@ async function runScraper() {
       timeout: 60000
     });
 
-    // Wait for the page to be ready
-    await new Promise(r => setTimeout(r, 5000));
-
-    // INFILTRATION: Instead of clicking, we try to fetch from the page context
-    // This uses the page's existing auth and headers
-    console.log('🕵️ Executing stealth fetch from page context...');
-    const result = await page.evaluate(async () => {
-      try {
-        const response = await fetch('https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas/listadosInicialPlazas');
-        return await response.json();
-      } catch (e) {
-        return null;
+    console.log('🖱️ Selecting MEDICINA to trigger token generation...');
+    await page.evaluate(() => {
+      const selects = document.querySelectorAll('select');
+      for (const s of selects) {
+        if (s.innerText.includes('MEDICINA') || s.innerHTML.includes('MEDICINA')) {
+          s.value = s.options[1].value;
+          s.dispatchEvent(new Event('change'));
+        }
       }
     });
 
-    if (result && (result.data || Array.isArray(result))) {
-      const data = result.data || result;
+    // Wait for the token to be captured
+    let waitCount = 0;
+    while (!authHeader && waitCount < 15) {
+      await new Promise(r => setTimeout(r, 1000));
+      waitCount++;
+    }
+
+    if (authHeader) {
+      console.log('🔑 Authorization Token captured! Executing privileged fetch...');
+      const data = await page.evaluate(async (token) => {
+        const response = await fetch('https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas/listadosInicialPlazas', {
+          headers: { 'Authorization': token }
+        });
+        const json = await response.json();
+        return json.data || json;
+      }, authHeader);
+
       if (Array.isArray(data) && data.length > 0) {
-        console.log(`✅ Stealth fetch successful! Found ${data.length} records.`);
+        console.log(`✅ SUCCESS: Fetched ${data.length} records using captured token.`);
         interceptedData = data;
       }
     }
 
     if (!interceptedData) {
-      console.log('🔄 Stealth fetch failed, trying manual interaction...');
-      // Select MEDICINA if dropdown exists
-      await page.evaluate(() => {
-        const selects = document.querySelectorAll('select');
-        for (const s of selects) {
-          if (s.innerText.includes('MEDICINA') || s.innerHTML.includes('MEDICINA')) {
-            s.value = s.options[1].value; // Usually the second option
-            s.dispatchEvent(new Event('change'));
-          }
-        }
-      });
-      
-      await new Promise(r => setTimeout(r, 2000));
-      
-      // Click Consultar
+      console.log('🔄 Token fetch failed, trying final manual interaction...');
       await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
-        const target = btns.find(b => b.innerText.includes('Consultar') || b.textContent.includes('Consultar'));
+        const target = btns.find(b => b.innerText.includes('Consultar'));
         if (target) target.click();
       });
-
-      // Wait for data to appear
-      let waitCount = 0;
-      while (!interceptedData && waitCount < 30) {
+      let finalWait = 0;
+      while (!interceptedData && finalWait < 20) {
         await new Promise(r => setTimeout(r, 1000));
-        waitCount++;
+        finalWait++;
       }
     }
 
@@ -120,7 +123,7 @@ async function runScraper() {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Failed to capture data after all methods.');
+      console.error('❌ Failed to capture data. Portal might be down or heavily protected.');
       process.exit(1);
     }
 
