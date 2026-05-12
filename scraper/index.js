@@ -27,43 +27,48 @@ const normalizeText = (text) => {
 const generateId = (text) => normalizeText(text);
 
 async function runScraper() {
-  console.log('🕵️ Starting "Stealth Infiltrator" MIR Scraper...');
+  console.log('🏇 Starting "Trojan Hunter" MIR Scraper...');
   
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1920,1080']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
+  await page.setCacheEnabled(false);
 
   let interceptedData = null;
 
   page.on('response', async (response) => {
-    const url = response.url();
-    if (url.includes('api/datos') && response.status() === 200) {
-      try {
+    try {
+      const url = response.url();
+      if (url.includes('api/datos') && response.status() === 200) {
         const text = await response.text();
-        if (text && text.includes('numOrden') && text.length > 50000) {
+        if (text && text.includes('numOrden')) {
           const json = JSON.parse(text);
           const data = json.data || json;
-          if (Array.isArray(data)) {
-            console.log(`🎯 SUCCESS: Captured ${data.length} records!`);
+          if (Array.isArray(data) && data.length > 100) {
+            console.log(`🎯 TARGET ACQUIRED: Captured ${data.length} records!`);
             interceptedData = data;
           }
         }
-      } catch (e) {}
-    }
+      }
+    } catch (e) {}
   });
 
   try {
-    console.log('📡 Navigating to Portal (Stealth Mode)...');
+    console.log('🏠 Visiting Home Page to get cookies...');
+    await page.goto('https://fse.sanidad.gob.es/fseweb/', { waitUntil: 'networkidle2', timeout: 60000 });
+    await new Promise(r => setTimeout(r, 5000));
+
+    console.log('📡 Jumping to Adjudicaciones page...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
       waitUntil: 'networkidle2',
-      timeout: 90000
+      timeout: 60000
     });
 
-    await new Promise(r => setTimeout(r, 4000));
+    await new Promise(r => setTimeout(r, 5000));
 
     console.log('🖱️ Selecting MEDICINA...');
     await page.evaluate(() => {
@@ -76,19 +81,22 @@ async function runScraper() {
       }
     });
 
-    await new Promise(r => setTimeout(r, 6000));
+    await new Promise(r => setTimeout(r, 10000));
 
-    console.log('🖱️ Searching and clicking "Consultar"...');
+    console.log('⌨️ Brute-forcing "Consultar" with Keyboard and All Clicks...');
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    
     await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, a, span, div'));
-      const target = btns.find(b => b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar'));
-      if (target) {
-        target.scrollIntoView();
-        target.click();
-      }
+      const btns = Array.from(document.querySelectorAll('button, a, span, div, i'));
+      btns.forEach(b => {
+        if (b.innerText?.includes('Consultar') || b.textContent?.includes('Consultar')) {
+          b.click();
+        }
+      });
     });
 
-    console.log('⏳ Waiting for data flow (up to 60s)...');
+    console.log('⏳ Waiting for data flow (60s)...');
     for (let i = 0; i < 60; i++) {
       if (interceptedData) break;
       await new Promise(r => setTimeout(r, 1000));
@@ -98,7 +106,7 @@ async function runScraper() {
       await processAndSaveData(interceptedData);
       console.log('🏁 Scraper finished successfully!');
     } else {
-      console.error('❌ Data capture failed even in Stealth Mode.');
+      console.error('❌ Data capture failed.');
       process.exit(1);
     }
 
@@ -111,8 +119,7 @@ async function runScraper() {
 }
 
 async function processAndSaveData(data) {
-  console.log(`📊 Saving ${data.length} records to Supabase...`);
-  // Reusing the robust mapping logic
+  console.log(`📊 Saving ${data.length} records...`);
   const { data: specialties } = await supabase.from('specialties').select('*');
   const specialtyMap = new Map(specialties.map(s => [s.name.toLowerCase(), s.id]));
   const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
