@@ -30,23 +30,29 @@ function generateId(text) {
 }
 
 async function runScraper() {
+  const isCI = process.env.CI === 'true';
+  console.log(`🚀 Starting MIR Scraper (CI: ${isCI})...`);
+
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions'
+    ]
   });
 
   try {
     const page = await browser.newPage();
-    
-    // Listen to browser console
-    page.on('console', msg => {
-      const text = msg.text();
-      console.log(`[Browser] ${text}`);
-    });
 
-    console.log('🐴 Starting "Final Solution" MIR Scraper (Sanidad Page-based)...');
-    
-    let authToken, xsrfToken;
+    // Forward browser console to Node
+    page.on('console', msg => console.log(`[Browser] ${msg.text()}`));
+
+    let authToken = null;
+    let xsrfToken = null;
+
     page.on('request', request => {
       const headers = request.headers();
       if (headers['authorization']?.startsWith('Bearer ')) {
@@ -57,92 +63,69 @@ async function runScraper() {
       }
     });
 
-    console.log('📡 Phase 1: Capturing tokens from Sanidad portal...');
-    await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
-      waitUntil: 'networkidle2',
-      timeout: 90000
-    });
+    console.log('📡 Phase 1: Loading Sanidad portal to capture auth tokens...');
+    await page.goto(
+      'https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas',
+      { waitUntil: 'networkidle2', timeout: 120000 }
+    );
 
-    await new Promise(r => setTimeout(r, 15000));
+    // Wait for Angular app to initialize and make its initial API calls
+    const WAIT_MS = isCI ? 25000 : 15000;
+    console.log(`⏳ Waiting ${WAIT_MS / 1000}s for app initialization...`);
+    await new Promise(r => setTimeout(r, WAIT_MS));
 
-    if (!authToken || !xsrfToken) {
-      console.error('❌ Auth failed: No tokens captured on Sanidad domain.');
+    if (!authToken) {
+      console.error('❌ Auth failed: No Bearer token captured. The page may have blocked the request.');
+      await updateConfigError('No se capturó el token de autenticación.');
       process.exit(1);
     }
 
-    console.log('🎯 Phase 2: Running offset-based fetch (GET to Sanidad API)...');
-    
-    // We execute the fetch inside the browser context to use the captured tokens and avoid CORS/Auth issues
-    const allRecords = await page.evaluate(async (token, xsrf) => {
-      let results = [];
-      let offset = 0;
-      const LIMIT = 400;
-      const MAX_RECORDS = 20000; // Safety cap
-      
-      while (offset < MAX_RECORDS) {
-        try {
-          const url = `https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M&offset=${offset}&limit=${LIMIT}`;
-          console.log(`Fetching ${url}...`);
-          
-          const response = await fetch(url, {
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'X-XSRF-TOKEN': xsrf,
-              'Process-Type': 'MENU'
-            }
-          });
+    console.log(`✅ Tokens captured. Auth: ${authToken.substring(0, 10)}...`);
 
-          if (!response.ok) {
-            console.error(`HTTP Error: ${response.status}`);
-            break;
-          }
-          const data = await response.json();
-          
-          if (Array.isArray(data) && data.length > 0) {
-            const firstId = data[0].numorden || data[0].n_ORDEN;
-            console.log(`   Offset ${offset}: Received ${data.length} records. (First Order: ${firstId})`);
-            
-            // Check for repeats (if the first record is the same as the last record of previous fetch)
-            if (results.length > 0 && results[results.length - 1].n_ORDEN === firstId) {
-               console.log('   ⚠️ Data is repeating. Pagination might be failing. Stopping.');
-               break;
-            }
+    // The API only returns the LAST 400 adjudications regardless of offset.
+    // We fetch once per run and accumulate in the DB over time.
+    console.log('🎯 Phase 2: Fetching latest 400 adjudications from API...');
 
-            results = results.concat(data);
-            if (data.length < LIMIT) break;
-            offset += data.length;
-          } else {
-            console.log(`   Offset ${offset}: No more records.`);
-            break;
-          }
-        } catch (e) {
-          console.error(`   Error at offset ${offset}: ${e.message}`);
-          break;
+    const records = await page.evaluate(async (token, xsrf) => {
+      const url = `https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M&offset=0&limit=400`;
+      console.log(`Fetching: ${url}`);
+
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-XSRF-TOKEN': xsrf,
+          'Accept': 'application/json',
+          'Process-Type': 'MENU'
         }
+      });
+
+      if (!response.ok) {
+        console.error(`HTTP Error: ${response.status} ${response.statusText}`);
+        return [];
       }
-      return results;
+
+      const data = await response.json();
+      console.log(`Received ${Array.isArray(data) ? data.length : 'non-array'} records`);
+      return Array.isArray(data) ? data : [];
     }, authToken, xsrfToken);
 
-    if (allRecords && allRecords.length > 0) {
-      // Deduplicate by order_number
-      const uniqueRecords = Array.from(new Map(allRecords.map(item => [item.numorden || item.n_ORDEN, item])).values());
-      console.log(`✅ Total records captured: ${allRecords.length} (Unique: ${uniqueRecords.length})`);
-      await processAndSaveData(uniqueRecords);
-      
-      // Update config on success
-      await supabase.from('scraper_config').update({
-        last_scrape_at: new Date().toISOString(),
-        last_scrape_status: 'success',
-        last_error_message: null,
-        total_adjudications_processed: allRecords.length,
-        updated_at: new Date().toISOString()
-      }).limit(1);
-
-    } else {
-      console.error('❌ Failed to capture any records via page-based GET.');
-      await updateConfigError('No se capturaron registros de la API.');
+    if (!records || records.length === 0) {
+      console.error('❌ No records received from the API.');
+      await updateConfigError('La API no devolvió registros.');
       process.exit(1);
     }
+
+    console.log(`✅ Captured ${records.length} records from API.`);
+    await processAndSaveData(records);
+
+    await supabase.from('scraper_config').update({
+      last_scrape_at: new Date().toISOString(),
+      last_scrape_status: 'success',
+      last_error_message: null,
+      total_adjudications_processed: records.length,
+      updated_at: new Date().toISOString()
+    }).limit(1);
+
   } catch (error) {
     console.error('❌ Scraper error:', error.message);
     await updateConfigError(error.message);
@@ -161,22 +144,25 @@ async function updateConfigError(message) {
       updated_at: new Date().toISOString()
     }).limit(1);
   } catch (e) {
-    console.error('Failed to update scraper config with error:', e.message);
+    console.error('Failed to update scraper config:', e.message);
   }
 }
 
 async function processAndSaveData(data) {
   console.log(`📊 Processing ${data.length} records...`);
-  
-  // 1. Fetch official lists for matching
+
   const { data: specialties } = await supabase.from('specialties').select('*');
   const { data: hospitals } = await supabase.from('hospitals').select('*');
   const { data: slots } = await supabase.from('slots').select('hospital_id, specialty_id');
 
-  const specialtyMap = new Map((specialties || []).map(s => [s.name.toLowerCase(), s.id]));
-  const hospitalMap = new Map((hospitals || []).map(h => [`${normalizeText(h.province)}-${normalizeText(h.name)}`, h.id]));
-  
-  // Create a helper for fuzzy matching (removing noise)
+  if (!specialties || !hospitals || !slots) {
+    console.error('❌ Failed to load reference data from Supabase.');
+    return;
+  }
+
+  const specialtyMap = new Map((specialties).map(s => [s.name.toLowerCase(), s.id]));
+  const hospitalMap = new Map((hospitals).map(h => [`${normalizeText(h.province)}-${normalizeText(h.name)}`, h.id]));
+
   const cleanName = (name) => {
     return normalizeText(name)
       .replace(/hospital|universitario|clinico|complejo|sanitario|fundacion|general|infantil|materno|udm|geriatria|unidad|docente/g, '')
@@ -187,20 +173,19 @@ async function processAndSaveData(data) {
   const findBestHospitalId = (hospName, province) => {
     const provinceNorm = normalizeText(province);
     const hospNorm = normalizeText(hospName);
-    
-    // 1. Try direct match
+
+    // 1. Direct key match
     const directId = `${provinceNorm}-${hospNorm}`;
     if (hospitalMap.has(directId)) return hospitalMap.get(directId);
-    
-    // 2. Try matching by only the first part of the province (e.g. "VALENCIA" in "VALENCIA/VALÈNCIA")
+
+    // 2. Province fuzzy match (handle "VALENCIA/VALÈNCIA" style)
     const provinceFirstPart = provinceNorm.split(/[\/\-]/)[0].trim();
-    
-    // 3. Try fuzzy match within matching province
-    const provinceHospitals = (hospitals || []).filter(h => {
+    const provinceHospitals = hospitals.filter(h => {
       const hProvNorm = normalizeText(h.province);
       return hProvNorm.includes(provinceFirstPart) || provinceNorm.includes(hProvNorm.split(/[\/\-]/)[0].trim());
     });
-    
+
+    // 3. Fuzzy name match within province
     const cleanHosp = cleanName(hospName);
     for (const h of provinceHospitals) {
       const hClean = cleanName(h.name);
@@ -208,22 +193,18 @@ async function processAndSaveData(data) {
         return h.id;
       }
     }
-    
-    return directId; // Fallback to generated ID
+
+    return directId; // Fallback (won't match any slot, so it will be filtered out)
   };
 
   const findBestSpecialtyId = (specName) => {
     if (!specName) return 'unknown';
     const specNorm = specName.toLowerCase();
-    // 1. Try direct map
     if (specialtyMap.has(specNorm)) return specialtyMap.get(specNorm);
-    
-    // 2. Try clean name match
     const cleanSpec = cleanName(specName);
-    for (const s of (specialties || [])) {
+    for (const s of specialties) {
       if (cleanName(s.name) === cleanSpec) return s.id;
     }
-    
     return generateId(specName);
   };
 
@@ -231,10 +212,9 @@ async function processAndSaveData(data) {
     const sName = item.desespec || item.descEspecialidad || item.especialidad;
     const hName = item.descentro || item.descCentro || item.centro;
     const orderNum = item.numorden || item.numOrden || item.n_ORDEN;
-    
     if (!sName || !hName || !orderNum) return null;
     const province = item.despro || item.descProvincia || item.provincia || '';
-    
+
     return {
       order_number: parseInt(orderNum),
       specialty_name: sName,
@@ -245,21 +225,23 @@ async function processAndSaveData(data) {
     };
   }).filter(Boolean);
 
-  console.log(`   Valid records processed: ${upserts.length}`);
-  
-  // Filter only those that match an existing slot (to avoid polluting the DB)
-  const slotSet = new Set((slots || []).map(s => `${s.hospital_id}|${s.specialty_id}`));
+  console.log(`   Valid records: ${upserts.length}`);
+
+  // Only upsert records that match an existing slot
+  const slotSet = new Set((slots).map(s => `${s.hospital_id}|${s.specialty_id}`));
   const matchedUpserts = upserts.filter(u => slotSet.has(`${u.hospital_id}|${u.specialty_id}`));
-  
-  console.log(`   Records matching known slots: ${matchedUpserts.length}`);
+  console.log(`   Matching known slots: ${matchedUpserts.length}`);
+
+  if (matchedUpserts.length === 0) {
+    console.log('⚠️ No records matched any tracked slot. Nothing to upsert.');
+    return;
+  }
 
   const BATCH_SIZE = 400;
   let successCount = 0;
-
   for (let i = 0; i < matchedUpserts.length; i += BATCH_SIZE) {
     const batch = matchedUpserts.slice(i, i + BATCH_SIZE);
     const { error } = await supabase.from('adjudications').upsert(batch, { onConflict: 'order_number' });
-
     if (error) {
       console.error(`   ❌ Batch ${i / BATCH_SIZE + 1} failed: ${error.message}`);
     } else {
@@ -267,16 +249,16 @@ async function processAndSaveData(data) {
     }
   }
 
-  console.log(`   ✅ Successfully upserted ${successCount} matched records.`);
+  console.log(`   ✅ Upserted ${successCount} records.`);
 
   if (successCount > 0) {
-    try {
-      await supabase.rpc('update_available_slots');
-      console.log('   ✅ Available slots updated in database!');
-    } catch (e) {
-      console.error('   ⚠️ RPC error updating slots:', e.message);
+    const { error: rpcError } = await supabase.rpc('update_available_slots');
+    if (rpcError) {
+      console.error(`   ⚠️ RPC error: ${rpcError.message}`);
+    } else {
+      console.log('   ✅ Available slots updated!');
     }
-    console.log(`🚀 Total records synced: ${successCount}`);
+    console.log(`🏁 Done. Total synced: ${successCount}`);
   }
 }
 
