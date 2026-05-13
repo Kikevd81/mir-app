@@ -1,237 +1,273 @@
-require('dotenv').config({ path: '../.env' });
-const { createClient } = require('@supabase/supabase-js');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { createClient } from '@supabase/supabase-js';
+import * as dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 puppeteer.use(StealthPlugin());
 
-const supabaseUrl = process.env.VITE_SUPABASE_URL;
-const supabaseKey = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY;
+const supabase = createClient(
+  process.env.VITE_SUPABASE_URL,
+  process.env.VITE_SUPABASE_SERVICE_ROLE_KEY
+);
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('❌ Missing environment variables');
-  process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-const normalizeText = (text) => {
+function normalizeText(text) {
   if (!text) return '';
   return text.toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
-};
+}
 
-const generateId = (text) => normalizeText(text);
+function generateId(text) {
+  return normalizeText(text);
+}
 
 async function runScraper() {
-  console.log('🐴 Starting "Inside Trojan" MIR Scraper...');
-  console.log('   Strategy: Hijack Angular session → Direct API call');
-  
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
-  });
-
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1920, height: 1080 });
-
-  // Phase 1: Intercept the Bearer token from the Angular app's auth flow
-  let authToken = null;
-  let xsrfToken = null;
-
-  page.on('request', (request) => {
-    const headers = request.headers();
-    if (headers['authorization'] && headers['authorization'].startsWith('Bearer ')) {
-      authToken = headers['authorization'].replace('Bearer ', '');
-      console.log(`🔑 Token captured: ${authToken.substring(0, 20)}...`);
-    }
-    if (headers['x-xsrf-token']) {
-      xsrfToken = headers['x-xsrf-token'];
-      console.log(`🛡️ XSRF token captured: ${xsrfToken.substring(0, 20)}...`);
-    }
-  });
-
-  // Also listen for token in responses (from the OAuth endpoint)
-  page.on('response', async (response) => {
-    try {
-      const url = response.url();
-      if (url.includes('oidc/token') && response.status() === 200) {
-        const json = await response.json();
-        if (json.access_token) {
-          authToken = json.access_token;
-          console.log(`🔑 Token from OAuth: ${authToken.substring(0, 20)}...`);
-        }
-      }
-    } catch (e) {}
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
   try {
-    // Phase 1: Let Angular boot and authenticate
-    console.log('📡 Phase 1: Loading portal and letting Angular authenticate...');
+    const page = await browser.newPage();
+    
+    // Listen to browser console
+    page.on('console', msg => {
+      const text = msg.text();
+      console.log(`[Browser] ${text}`);
+    });
+
+    console.log('🐴 Starting "Final Solution" MIR Scraper (Sanidad Page-based)...');
+    
+    let authToken, xsrfToken;
+    page.on('request', request => {
+      const headers = request.headers();
+      if (headers['authorization']?.startsWith('Bearer ')) {
+        authToken = headers['authorization'].split(' ')[1];
+      }
+      if (headers['x-xsrf-token']) {
+        xsrfToken = headers['x-xsrf-token'];
+      }
+    });
+
+    console.log('📡 Phase 1: Capturing tokens from Sanidad portal...');
     await page.goto('https://fse.sanidad.gob.es/fseweb/#/principal/adjudicacionPlazas/ConsultaPlazasAdjudicadas', {
       waitUntil: 'networkidle2',
       timeout: 90000
     });
 
-    // Wait for the app to fully initialize and make its auth calls
-    await new Promise(r => setTimeout(r, 10000));
+    await new Promise(r => setTimeout(r, 15000));
 
-    console.log(`🔐 Auth status: token=${authToken ? 'YES' : 'NO'}, xsrf=${xsrfToken ? 'YES' : 'NO'}`);
-
-    // Phase 2: Make direct API call from within the page context
-    console.log('🎯 Phase 2: Direct API call to getPlazasAdjudicadas...');
-    
-    const apiData = await page.evaluate(async (token, xsrf) => {
-      // Build headers exactly like the Angular app does
-      const headers = {
-        'Content-Type': 'application/json',
-        'pragma': 'no-cache',
-        'cache-control': 'no-cache'
-      };
-      if (token) headers['Authorization'] = 'Bearer ' + token;
-      if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
-      headers['Process-Type'] = 'MENU';
-
-      // Call the API with tipoBusqueda empty (get all) and idTitulo for MEDICINA
-      const params = new URLSearchParams();
-      params.set('tipoBusqueda', '');
-      params.set('idTitulo', 'M');  // MEDICINA
-
-      const url = '/hera/api/datos/convocatoria/getPlazasAdjudicadas?' + params.toString();
-      
-      try {
-        const response = await fetch(url, { headers, credentials: 'include' });
-        if (!response.ok) {
-          return { error: `HTTP ${response.status}: ${await response.text()}` };
-        }
-        const data = await response.json();
-        return { success: true, data: data, count: Array.isArray(data) ? data.length : (data.data ? data.data.length : 'unknown') };
-      } catch (e) {
-        return { error: e.message };
-      }
-    }, authToken, xsrfToken);
-
-    if (apiData.error) {
-      console.log(`⚠️ First attempt failed: ${apiData.error}`);
-      console.log('🔄 Trying alternative: getPlazasAdjudicadasTotal...');
-      
-      // Try the Total endpoint
-      const totalData = await page.evaluate(async (token, xsrf) => {
-        const headers = {
-          'Content-Type': 'application/json',
-          'pragma': 'no-cache',
-          'cache-control': 'no-cache'
-        };
-        if (token) headers['Authorization'] = 'Bearer ' + token;
-        if (xsrf) headers['X-XSRF-TOKEN'] = xsrf;
-        headers['Process-Type'] = 'MENU';
-
-        try {
-          // Try multiple endpoints
-          const endpoints = [
-            '/hera/api/datos/convocatoria/getPlazasAdjudicadasTotal',
-            '/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=plazaCentro&idTitulo=M',
-            '/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M',
-            '/hera/api/datos/convocatoria/getPlazasAdjudicadas'
-          ];
-          
-          for (const endpoint of endpoints) {
-            const response = await fetch(endpoint, { headers, credentials: 'include' });
-            if (response.ok) {
-              const data = await response.json();
-              const records = Array.isArray(data) ? data : (data.data || data);
-              if (Array.isArray(records) && records.length > 0) {
-                return { success: true, data: records, endpoint };
-              }
-            }
-          }
-          return { error: 'All endpoints returned empty or failed' };
-        } catch (e) {
-          return { error: e.message };
-        }
-      }, authToken, xsrfToken);
-      
-      if (totalData.success) {
-        console.log(`✅ Got ${totalData.data.length} records from ${totalData.endpoint}`);
-        await processAndSaveData(totalData.data);
-        console.log('🏁 Scraper finished successfully!');
-      } else {
-        console.error(`❌ All API attempts failed: ${totalData.error}`);
-        process.exit(1);
-      }
-    } else {
-      const records = Array.isArray(apiData.data) ? apiData.data : (apiData.data?.data || apiData.data);
-      if (Array.isArray(records) && records.length > 0) {
-        console.log(`✅ Got ${records.length} records from primary endpoint`);
-        await processAndSaveData(records);
-        console.log('🏁 Scraper finished successfully!');
-      } else {
-        console.log(`⚠️ API returned data but no records array. Response shape: ${JSON.stringify(apiData).substring(0, 200)}`);
-        process.exit(1);
-      }
+    if (!authToken || !xsrfToken) {
+      console.error('❌ Auth failed: No tokens captured on Sanidad domain.');
+      process.exit(1);
     }
 
+    console.log('🎯 Phase 2: Running offset-based fetch (GET to Sanidad API)...');
+    
+    // We execute the fetch inside the browser context to use the captured tokens and avoid CORS/Auth issues
+    const allRecords = await page.evaluate(async (token, xsrf) => {
+      let results = [];
+      let offset = 0;
+      const LIMIT = 400;
+      const MAX_RECORDS = 20000; // Safety cap
+      
+      while (offset < MAX_RECORDS) {
+        try {
+          const url = `https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M&offset=${offset}&limit=${LIMIT}`;
+          console.log(`Fetching ${url}...`);
+          
+          const response = await fetch(url, {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'X-XSRF-TOKEN': xsrf,
+              'Process-Type': 'MENU'
+            }
+          });
+
+          if (!response.ok) {
+            console.error(`HTTP Error: ${response.status}`);
+            break;
+          }
+          const data = await response.json();
+          
+          if (Array.isArray(data) && data.length > 0) {
+            const firstId = data[0].numorden || data[0].n_ORDEN;
+            console.log(`   Offset ${offset}: Received ${data.length} records. (First Order: ${firstId})`);
+            
+            // Check for repeats (if the first record is the same as the last record of previous fetch)
+            if (results.length > 0 && results[results.length - 1].n_ORDEN === firstId) {
+               console.log('   ⚠️ Data is repeating. Pagination might be failing. Stopping.');
+               break;
+            }
+
+            results = results.concat(data);
+            if (data.length < LIMIT) break;
+            offset += data.length;
+          } else {
+            console.log(`   Offset ${offset}: No more records.`);
+            break;
+          }
+        } catch (e) {
+          console.error(`   Error at offset ${offset}: ${e.message}`);
+          break;
+        }
+      }
+      return results;
+    }, authToken, xsrfToken);
+
+    if (allRecords && allRecords.length > 0) {
+      // Deduplicate by order_number
+      const uniqueRecords = Array.from(new Map(allRecords.map(item => [item.numorden || item.n_ORDEN, item])).values());
+      console.log(`✅ Total records captured: ${allRecords.length} (Unique: ${uniqueRecords.length})`);
+      await processAndSaveData(uniqueRecords);
+      
+      // Update config on success
+      await supabase.from('scraper_config').update({
+        last_scrape_at: new Date().toISOString(),
+        last_scrape_status: 'success',
+        last_error_message: null,
+        total_adjudications_processed: allRecords.length,
+        updated_at: new Date().toISOString()
+      }).limit(1);
+
+    } else {
+      console.error('❌ Failed to capture any records via page-based GET.');
+      await updateConfigError('No se capturaron registros de la API.');
+      process.exit(1);
+    }
   } catch (error) {
-    console.error('❌ Fatal error:', error.message);
+    console.error('❌ Scraper error:', error.message);
+    await updateConfigError(error.message);
     process.exit(1);
   } finally {
     await browser.close();
   }
 }
 
+async function updateConfigError(message) {
+  try {
+    await supabase.from('scraper_config').update({
+      last_scrape_at: new Date().toISOString(),
+      last_scrape_status: 'error',
+      last_error_message: message,
+      updated_at: new Date().toISOString()
+    }).limit(1);
+  } catch (e) {
+    console.error('Failed to update scraper config with error:', e.message);
+  }
+}
+
 async function processAndSaveData(data) {
   console.log(`📊 Processing ${data.length} records...`);
+  
+  // 1. Fetch official lists for matching
   const { data: specialties } = await supabase.from('specialties').select('*');
-  const specialtyMap = new Map((specialties || []).map(s => [s.name.toLowerCase(), s.id]));
-  const { data: existingSlots } = await supabase.from('slots').select('hospital_id');
-  const existingHospitalIds = [...new Set((existingSlots || []).map(s => s.hospital_id))];
+  const { data: hospitals } = await supabase.from('hospitals').select('*');
+  const { data: slots } = await supabase.from('slots').select('hospital_id, specialty_id');
 
-  const findBestHospitalId = (hospName, province, locality) => {
-    const normName = normalizeText(hospName);
-    const p2 = `${normalizeText(province)}-${normName}`;
-    return existingHospitalIds.includes(p2) ? p2 : p2;
+  const specialtyMap = new Map((specialties || []).map(s => [s.name.toLowerCase(), s.id]));
+  const hospitalMap = new Map((hospitals || []).map(h => [`${normalizeText(h.province)}-${normalizeText(h.name)}`, h.id]));
+  
+  // Create a helper for fuzzy matching (removing noise)
+  const cleanName = (name) => {
+    return normalizeText(name)
+      .replace(/hospital|universitario|clinico|complejo|sanitario|fundacion|general|infantil|materno|udm|geriatria|unidad|docente/g, '')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  };
+
+  const findBestHospitalId = (hospName, province) => {
+    const provinceNorm = normalizeText(province);
+    const hospNorm = normalizeText(hospName);
+    
+    // 1. Try direct match
+    const directId = `${provinceNorm}-${hospNorm}`;
+    if (hospitalMap.has(directId)) return hospitalMap.get(directId);
+    
+    // 2. Try matching by only the first part of the province (e.g. "VALENCIA" in "VALENCIA/VALÈNCIA")
+    const provinceFirstPart = provinceNorm.split(/[\/\-]/)[0].trim();
+    
+    // 3. Try fuzzy match within matching province
+    const provinceHospitals = (hospitals || []).filter(h => {
+      const hProvNorm = normalizeText(h.province);
+      return hProvNorm.includes(provinceFirstPart) || provinceNorm.includes(hProvNorm.split(/[\/\-]/)[0].trim());
+    });
+    
+    const cleanHosp = cleanName(hospName);
+    for (const h of provinceHospitals) {
+      const hClean = cleanName(h.name);
+      if (hClean === cleanHosp || hClean.includes(cleanHosp) || cleanHosp.includes(hClean)) {
+        return h.id;
+      }
+    }
+    
+    return directId; // Fallback to generated ID
+  };
+
+  const findBestSpecialtyId = (specName) => {
+    if (!specName) return 'unknown';
+    const specNorm = specName.toLowerCase();
+    // 1. Try direct map
+    if (specialtyMap.has(specNorm)) return specialtyMap.get(specNorm);
+    
+    // 2. Try clean name match
+    const cleanSpec = cleanName(specName);
+    for (const s of (specialties || [])) {
+      if (cleanName(s.name) === cleanSpec) return s.id;
+    }
+    
+    return generateId(specName);
   };
 
   const upserts = data.map(item => {
-    const sName = item.desespec || item.descEspecialidad;
-    const hName = item.descentro || item.descCentro;
-    if (!sName || !hName) return null;
-
-    const province = item.despro || item.descProvincia || '';
+    const sName = item.desespec || item.descEspecialidad || item.especialidad;
+    const hName = item.descentro || item.descCentro || item.centro;
+    const orderNum = item.numorden || item.numOrden || item.n_ORDEN;
+    
+    if (!sName || !hName || !orderNum) return null;
+    const province = item.despro || item.descProvincia || item.provincia || '';
     
     return {
-      order_number: parseInt(item.numorden || item.numOrden),
+      order_number: parseInt(orderNum),
       specialty_name: sName,
       hospital_name: hName,
       province: province,
-      specialty_id: specialtyMap.get(sName.toLowerCase()) || generateId(sName),
-      hospital_id: findBestHospitalId(hName, province, '')
+      specialty_id: findBestSpecialtyId(sName),
+      hospital_id: findBestHospitalId(hName, province)
     };
   }).filter(Boolean);
 
-  console.log(`   Valid records to upsert: ${upserts.length}`);
-  const BATCH_SIZE = 50;
+  console.log(`   Valid records processed: ${upserts.length}`);
+  
+  // Filter only those that match an existing slot (to avoid polluting the DB)
+  const slotSet = new Set((slots || []).map(s => `${s.hospital_id}|${s.specialty_id}`));
+  const matchedUpserts = upserts.filter(u => slotSet.has(`${u.hospital_id}|${u.specialty_id}`));
+  
+  console.log(`   Records matching known slots: ${matchedUpserts.length}`);
+
+  const BATCH_SIZE = 400;
   let successCount = 0;
 
-  for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
-    const batch = upserts.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < matchedUpserts.length; i += BATCH_SIZE) {
+    const batch = matchedUpserts.slice(i, i + BATCH_SIZE);
     const { error } = await supabase.from('adjudications').upsert(batch, { onConflict: 'order_number' });
 
     if (error) {
       console.error(`   ❌ Batch ${i / BATCH_SIZE + 1} failed: ${error.message}`);
-      if (error.message.includes('WHERE clause')) {
-        console.error('   ⚠️ DATABASE BLOCK: A trigger in your Supabase database is preventing updates.');
-        console.error('   👉 FIX: Apply the updated SQL in 003_scraper_trigger.sql to your Supabase SQL Editor.');
-        break; 
-      }
     } else {
-      console.log(`   ✅ Batch ${i / BATCH_SIZE + 1}: ${batch.length} records OK`);
       successCount += batch.length;
     }
   }
+
+  console.log(`   ✅ Successfully upserted ${successCount} matched records.`);
 
   if (successCount > 0) {
     try {
@@ -240,11 +276,8 @@ async function processAndSaveData(data) {
     } catch (e) {
       console.error('   ⚠️ RPC error updating slots:', e.message);
     }
-    console.log(`🚀 Total records processed: ${successCount}`);
+    console.log(`🚀 Total records synced: ${successCount}`);
   }
 }
 
 runScraper();
-
-
-
