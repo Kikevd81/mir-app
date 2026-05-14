@@ -82,14 +82,11 @@ async function runScraper() {
 
     console.log(`✅ Tokens captured. Auth: ${authToken.substring(0, 10)}...`);
 
-    // The API only returns the LAST 400 adjudications regardless of offset.
-    // We fetch once per run and accumulate in the DB over time.
-    console.log('🎯 Phase 2: Fetching latest 400 adjudications from API...');
+    // Use the newly discovered "Total" endpoint to get all records
+    const apiUrl = `https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadasTotal?tipoBusqueda=&idTitulo=M&orden=null`;
+    console.log(`📡 Fetching full data from: ${apiUrl}`);
 
-    const records = await page.evaluate(async (token, xsrf) => {
-      const url = `https://fse.sanidad.gob.es/hera/api/datos/convocatoria/getPlazasAdjudicadas?tipoBusqueda=&idTitulo=M&offset=0&limit=400`;
-      console.log(`Fetching: ${url}`);
-
+    const records = await page.evaluate(async (url, token, xsrf) => {
       const response = await fetch(url, {
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -98,16 +95,9 @@ async function runScraper() {
           'Process-Type': 'MENU'
         }
       });
-
-      if (!response.ok) {
-        console.error(`HTTP Error: ${response.status} ${response.statusText}`);
-        return [];
-      }
-
-      const data = await response.json();
-      console.log(`Received ${Array.isArray(data) ? data.length : 'non-array'} records`);
-      return Array.isArray(data) ? data : [];
-    }, authToken, xsrfToken);
+      if (!response.ok) throw new Error(`API failed with status ${response.status}`);
+      return await response.json();
+    }, apiUrl, authToken, xsrfToken);
 
     if (!records || records.length === 0) {
       console.error('❌ No records received from the API.');
@@ -151,24 +141,49 @@ async function updateConfigError(message) {
 async function processAndSaveData(data) {
   console.log(`📊 Processing ${data.length} records...`);
 
-  const { data: specialties } = await supabase.from('specialties').select('*');
-  const { data: hospitals } = await supabase.from('hospitals').select('*');
-  const { data: slots } = await supabase.from('slots').select('hospital_id, specialty_id');
+  // Fetch all reference data (handling Supabase 1000 limit with pagination)
+  const fetchAll = async (table, select = '*') => {
+    let all = [];
+    let from = 0;
+    const step = 1000;
+    while (true) {
+      const { data: batch, error } = await supabase.from(table).select(select).range(from, from + step - 1);
+      if (error) throw error;
+      if (!batch || batch.length === 0) break;
+      all = all.concat(batch);
+      if (batch.length < step) break;
+      from += step;
+    }
+    return all;
+  };
 
-  if (!specialties || !hospitals || !slots) {
-    console.error('❌ Failed to load reference data from Supabase.');
-    return;
-  }
+  const specialties = await fetchAll('specialties');
+  const hospitals = await fetchAll('hospitals');
+  const slots = await fetchAll('slots', 'hospital_id, specialty_id');
+
+  console.log(`   Loaded reference data: ${specialties.length} specs, ${hospitals.length} hosps, ${slots.length} slots.`);
 
   const specialtyMap = new Map((specialties).map(s => [s.name.toLowerCase(), s.id]));
   const hospitalMap = new Map((hospitals).map(h => [`${normalizeText(h.province)}-${normalizeText(h.name)}`, h.id]));
 
-  const cleanName = (name) => {
-    return normalizeText(name)
-      .replace(/hospital|universitario|clinico|complejo|sanitario|fundacion|general|infantil|materno|udm|geriatria|unidad|docente/g, '')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '');
-  };
+  function cleanName(name) {
+    if (!name) return '';
+    let n = name.toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    
+    const noise = [
+        'hospital', 'universitario', 'clinico', 'complejo', 'sanitario', 
+        'fundacion', 'general', 'infantil', 'materno', 'udm', 'geriatria', 
+        'unidad', 'docente', 'serv', 'u', 'h', 'hosp', 'univ', 'de', 'del', 'la', 'el'
+    ];
+    
+    const words = n.split(' ').filter(w => !noise.includes(w));
+    return words.join('-');
+  }
 
   const findBestHospitalId = (hospName, province) => {
     const provinceNorm = normalizeText(province);

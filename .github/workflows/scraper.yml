@@ -77,4 +77,4 @@ jobs:
           echo "❌ ERROR: No se han configurado los Secrets en GitHub."
           exit 1
         fi
-        node index.js
+        node index.mjs

@@ -79,86 +79,56 @@ Deno.serve(async (req) => {
             }
         }
 
-        // 4. Hacer fetch a la web del Ministerio
-        console.log(`📥 Descargando datos de: ${config.ministry_url}`)
+        // 4. Trigger GitHub Action
+        console.log('🚀 Desencadenando GitHub Action para el scraper...')
+        
+        const GITHUB_PAT = Deno.env.get('GITHUB_PAT')
+        const GITHUB_OWNER = Deno.env.get('GITHUB_OWNER') || 'Kikevd81'
+        const GITHUB_REPO = Deno.env.get('GITHUB_REPO') || 'mir-app'
+        const GITHUB_WORKFLOW = 'scraper.yml'
 
-        // TODO: Implementar cuando se conozca la estructura real de la web
-        // Por ahora, simulamos una respuesta vacía para pruebas
-        const ministryUrl = config.ministry_url
+        if (!GITHUB_PAT) {
+            throw new Error('GITHUB_PAT no está configurado en las variables de entorno de Supabase')
+        }
 
-        // Placeholder: En producción, esto será un fetch real + parsing HTML/JSON
-        // const response = await fetch(ministryUrl)
-        // const html = await response.text()
-        // const adjudications = parseMinistryHtml(html) // Función a implementar
-
-        // Datos de prueba para desarrollo
-        const mockAdjudications: any[] = [
-            // Descomentar para probar con datos mock:
-            // { order_number: 1, specialty_name: 'OFTALMOLOGÍA', hospital_name: 'HOSPITAL VIRGEN DEL ROCÍO', region: 'ANDALUCÍA', province: 'SEVILLA' },
-            // { order_number: 2, specialty_name: 'DERMATOLOGÍA', hospital_name: 'HOSPITAL LA PAZ', region: 'MADRID', province: 'MADRID' },
-        ]
-
-        const adjudications = mockAdjudications
-
-        console.log(`📊 Datos obtenidos: ${adjudications.length} adjudicaciones`)
-
-        // 5. Procesar y guardar adjudicaciones
-        let newCount = 0
-        for (const adj of adjudications) {
-            // Generar IDs normalizados para vincular con nuestras tablas
-            const specId = generateId(adj.specialty_name)
-            const hospId = generateId(`${adj.province}-${adj.hospital_name}`)
-
-            // Insertar (ignorar si ya existe por order_number único)
-            const { error: insertError } = await supabase
-                .from('adjudications')
-                .upsert({
-                    order_number: adj.order_number,
-                    specialty_name: adj.specialty_name,
-                    hospital_name: adj.hospital_name,
-                    region: adj.region,
-                    province: adj.province,
-                    specialty_id: specId,
-                    hospital_id: hospId,
-                    scraped_at: new Date().toISOString()
-                }, { onConflict: 'order_number' })
-
-            if (!insertError) {
-                newCount++
+        const githubResponse = await fetch(
+            `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW}/dispatches`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${GITHUB_PAT}`,
+                    'Accept': 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'SupabaseEdgeFunction'
+                },
+                body: JSON.stringify({
+                    ref: 'main',
+                }),
             }
+        )
+
+        if (!githubResponse.ok) {
+            const errorText = await githubResponse.text()
+            throw new Error(`Error al disparar GitHub Action: ${githubResponse.status} ${errorText}`)
         }
 
-        console.log(`✅ Guardadas ${newCount} adjudicaciones nuevas`)
+        console.log('✅ GitHub Action disparada con éxito')
 
-        // 6. Actualizar plazas disponibles (restar adjudicadas del total)
-        // Llamar a la función SQL que creamos
-        const { error: updateError } = await supabase.rpc('update_available_slots')
-
-        if (updateError) {
-            console.error('⚠️ Error actualizando slots:', updateError)
-        } else {
-            console.log('🔢 Plazas disponibles actualizadas')
-        }
-
-        // 7. Actualizar estado del scraper
+        // 5. Actualizar estado del scraper
         await supabase
             .from('scraper_config')
             .update({
                 last_scrape_at: new Date().toISOString(),
-                last_scrape_status: 'success',
-                last_error_message: null,
-                total_adjudications_processed: (config.total_adjudications_processed || 0) + newCount,
+                last_scrape_status: 'running',
                 updated_at: new Date().toISOString()
             })
             .eq('id', config.id)
 
-        console.log('🎉 Scrape completado con éxito')
-
         return new Response(
             JSON.stringify({
                 status: 'success',
-                adjudications_processed: adjudications.length,
-                new_adjudications: newCount,
+                message: 'Scraper iniciado vía GitHub Actions',
                 timestamp: new Date().toISOString()
             }),
             { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
