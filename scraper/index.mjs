@@ -40,12 +40,24 @@ async function runScraper() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--disable-extensions'
+      '--disable-extensions',
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     ]
   });
 
   try {
     const page = await browser.newPage();
+    
+    // Set a realistic viewport
+    await page.setViewport({ width: 1920, height: 1080 });
+
+    // Set additional headers to look more like a real browser
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache'
+    });
 
     // Forward browser console to Node
     page.on('console', msg => console.log(`[Browser] ${msg.text()}`));
